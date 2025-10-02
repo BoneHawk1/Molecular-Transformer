@@ -1,0 +1,33 @@
+name: kstep
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - pyyaml
+  - tqdm
+  - cudatoolkit=12.1  # if on NVIDIA GPU; ignore on CPU/Mac
+  - openmm=8.*
+  - mdtraj
+  - mdanalysis
+  - matplotlib
+  - seaborn
+  - pip:
+      - torch==2.*
+      - torchvision==0.*
+      - torchaudio==2.*
+      - hydra-core
+      - wandb
+      - rdkit-pypi
+      - openff-toolkit
+      - openmmforcefields
+      - torchmd-net
+      - e3nn
+      - torch_geometric
+      - line_profiler
+      - rich
