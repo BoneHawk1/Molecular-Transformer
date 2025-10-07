@@ -3,6 +3,7 @@ channels:
   - conda-forge
   - pytorch
   - defaults
+  - nvidia
 dependencies:
   - python=3.11
   - pip
@@ -11,12 +12,15 @@ dependencies:
   - pandas
   - pyyaml
   - tqdm
-  - cudatoolkit=12.1  # if on NVIDIA GPU; ignore on CPU/Mac
+  - cuda-toolkit=12.1  # if on NVIDIA GPU; ignore on CPU/Mac
   - openmm=8.*
   - mdtraj
   - mdanalysis
   - matplotlib
   - seaborn
+  - ambertools
+  - openff-toolkit
+  - openmmforcefields
   - pip:
       - torch==2.*
       - torchvision==0.*
@@ -24,8 +28,6 @@ dependencies:
       - hydra-core
       - wandb
       - rdkit-pypi
-      - openff-toolkit
-      - openmmforcefields
       - torchmd-net
       - e3nn
       - torch_geometric
