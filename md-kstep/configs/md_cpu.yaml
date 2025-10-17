@@ -8,6 +8,6 @@ implicit_solvent: OBC2
 nonbonded_cutoff_nm: 1.0
 nve_window_ps: 100.0
 nve_every_ps: 200.0
-platform: CUDA
+platform: CPU
 random_seed: 42
 reporter_stride: 10

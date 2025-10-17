@@ -1,121 +1,173 @@
+"""Create supervised (x_t, v_t) -> (x_{t+k}, v_{t+k}) datasets from MD trajectories."""
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
-from utils import ensure_dir, get_logger, remove_com_translation, remove_com_velocity, save_npz
+
+from utils import (configure_logging, ensure_dir, remove_com, set_seed,
+                   write_json, LOGGER)
 
 
-def load_traj(npz_path: Path) -> Dict[str, np.ndarray]:
-    with np.load(npz_path) as d:
-        return {k: d[k] for k in d.files}
+def _load_trajectory(path: Path) -> Dict:
+    data = np.load(path, allow_pickle=True)
+    metadata = json.loads(str(data["metadata"])) if "metadata" in data else {}
+    return {
+        "pos": data["pos"],
+        "vel": data["vel"],
+        "box": data["box"],
+        "masses": data["masses"],
+        "atom_types": data["atom_types"],
+        "time_ps": data["time_ps"],
+        "metadata": metadata,
+    }
 
 
-def make_windows(
-    traj: Dict[str, np.ndarray],
-    k: int,
-    stride: int,
-    masses: np.ndarray | None = None,
-) -> Dict[str, np.ndarray]:
-    pos = traj["pos"]  # [T,N,3] nm
-    vel = traj["vel"]  # [T,N,3] nm/ps
-    T, N, _ = pos.shape
+def _enumerate_windows(num_frames: int, k_steps: int, stride: int) -> Iterable[int]:
+    max_start = num_frames - k_steps
+    for start in range(0, max_start, stride):
+        yield start
 
-    # indices
-    idx_t = np.arange(0, T - k, stride, dtype=np.int64)
-    idx_tk = idx_t + k
 
-    x_t = pos[idx_t]
-    v_t = vel[idx_t]
-    x_tk = pos[idx_tk]
-    v_tk = vel[idx_tk]
+def _process_window(traj: Dict, idx: int, k: int) -> Dict:
+    pos = traj["pos"]
+    vel = traj["vel"]
+    masses = traj["masses"]
 
-    if masses is None:
-        masses = np.ones((N,), dtype=np.float32)
+    x_t = pos[idx]
+    v_t = vel[idx]
+    x_tk = pos[idx + k]
+    v_tk = vel[idx + k]
 
-    # remove COM at both ends
-    x_t = remove_com_translation(x_t, masses)
-    v_t = remove_com_velocity(v_t, masses)
-    x_tk = remove_com_translation(x_tk, masses)
-    v_tk = remove_com_velocity(v_tk, masses)
-
-    atom_types = np.zeros((N,), dtype=np.int64)  # placeholder; can be set from topology
+    x_t_centered, v_t_centered = remove_com(x_t, v_t, masses)
+    x_tk_centered, v_tk_centered = remove_com(x_tk, v_tk, masses)
 
     return {
-        "x_t": x_t,
-        "v_t": v_t,
-        "x_tk": x_tk,
-        "v_tk": v_tk,
-        "atom_types": atom_types,
+        "x_t": x_t_centered.astype(np.float32),
+        "v_t": v_t_centered.astype(np.float32),
+        "x_tk": x_tk_centered.astype(np.float32),
+        "v_tk": v_tk_centered.astype(np.float32),
+        "masses": masses.astype(np.float32),
+        "atom_types": traj["atom_types"].astype(np.int64),
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Pack k-step windows from MD trajectories")
-    parser.add_argument("--md", type=str, required=True, help="Directory with *_traj.npz baseline files")
-    parser.add_argument("--splits", type=str, required=True, help="Directory to write train/val/test JSON")
-    parser.add_argument("--k", type=int, default=8)
-    parser.add_argument("--stride", type=int, default=10)
-    parser.add_argument("--out", type=str, required=True, help="Output dataset npz path")
-    parser.add_argument("--split_ratio", type=str, default="8,1,1", help="train,val,test ratios by molecules")
-    args = parser.parse_args()
+def _random_rotation_matrix() -> np.ndarray:
+    """Sample a random 3D rotation matrix using uniformly distributed quaternions."""
+    u1, u2, u3 = np.random.random(3)
+    q = np.array([
+        np.sqrt(1 - u1) * np.sin(2 * np.pi * u2),
+        np.sqrt(1 - u1) * np.cos(2 * np.pi * u2),
+        np.sqrt(u1) * np.sin(2 * np.pi * u3),
+        np.sqrt(u1) * np.cos(2 * np.pi * u3),
+    ], dtype=np.float64)
+    x, y, z, w = q
+    rotation = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float32)
+    return rotation
 
-    md_dir = Path(args.md)
-    ensure_dir(Path(args.splits))
-    ensure_dir(Path(args.out).parent)
-    logger = get_logger()
 
-    files = sorted(md_dir.glob("*_traj.npz"))
-    assert files, f"No trajectories found in {md_dir}"
-
-    mol_windows: List[Dict[str, np.ndarray]] = []
-    mol_ids: List[int] = []
-
-    for mid, f in enumerate(files):
-        traj = load_traj(f)
-        w = make_windows(traj, k=args.k, stride=args.stride)
-        n = w["x_t"].shape[0]
-        logger.info(f"{f.name}: {n} windows")
-        mol_windows.append(w)
-        mol_ids.extend([mid] * n)
-
-    # concatenate across molecules
-    x_t = np.concatenate([w["x_t"] for w in mol_windows], axis=0)
-    v_t = np.concatenate([w["v_t"] for w in mol_windows], axis=0)
-    x_tk = np.concatenate([w["x_tk"] for w in mol_windows], axis=0)
-    v_tk = np.concatenate([w["v_tk"] for w in mol_windows], axis=0)
-    atom_types = mol_windows[0]["atom_types"]  # assume same N and types across windows of a molecule
-    molecule_id = np.array(mol_ids, dtype=np.int64)
-
-    save_npz(args.out, x_t=x_t, v_t=v_t, x_tk=x_tk, v_tk=v_tk, atom_types=atom_types, molecule_id=molecule_id)
-    logger.info(f"Saved dataset: {args.out} ({x_t.shape[0]} samples)")
-
-    # Write splits by molecules
-    ratios = list(map(int, args.split_ratio.split(',')))
-    total = sum(ratios)
-    num_mols = len(files)
-    n_train = int(ratios[0] / total * num_mols)
-    n_val = int(ratios[1] / total * num_mols)
-    indices = np.arange(num_mols)
-    np.random.seed(42)
-    np.random.shuffle(indices)
-    splits = {
-        "train": indices[:n_train].tolist(),
-        "val": indices[n_train:n_train+n_val].tolist(),
-        "test": indices[n_train+n_val:].tolist(),
+def _apply_rotation(sample: Dict[str, np.ndarray], rotation: np.ndarray) -> Dict[str, np.ndarray]:
+    """Rotate positions and velocities for an existing sample."""
+    return {
+        "x_t": sample["x_t"] @ rotation.T,
+        "v_t": sample["v_t"] @ rotation.T,
+        "x_tk": sample["x_tk"] @ rotation.T,
+        "v_tk": sample["v_tk"] @ rotation.T,
+        "masses": sample["masses"],
+        "atom_types": sample["atom_types"],
     }
-    with open(Path(args.splits) / "train.json", "w") as f:
-        json.dump(splits["train"], f)
-    with open(Path(args.splits) / "val.json", "w") as f:
-        json.dump(splits["val"], f)
-    with open(Path(args.splits) / "test.json", "w") as f:
-        json.dump(splits["test"], f)
-    logger.info(f"Wrote splits to {args.splits}")
+
+
+def _save_dataset(samples: List[Dict], out_path: Path, molecule_ids: List[str], k: int) -> None:
+    ensure_dir(out_path.parent)
+    arrays = {
+        key: np.array([sample[key] for sample in samples], dtype=object)
+        for key in ["x_t", "v_t", "x_tk", "v_tk", "masses", "atom_types"]
+    }
+    np.savez(out_path, **arrays, molecule=np.array(molecule_ids), k_steps=k)
+    LOGGER.info("Wrote %d samples to %s", len(samples), out_path)
+
+
+def _build_splits(molecules: Sequence[str], splits_dir: Path, seed: int) -> None:
+    ensure_dir(splits_dir)
+    mols = list(molecules)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(mols)
+    n = len(mols)
+    n_train = int(0.7 * n)
+    n_val = int(0.15 * n)
+    split_data = {
+        "train": mols[:n_train],
+        "val": mols[n_train:n_train + n_val],
+        "test": mols[n_train + n_val:],
+    }
+    for split, items in split_data.items():
+        write_json({"molecules": items}, splits_dir / f"{split}.json")
+        LOGGER.info("%s split: %d molecules", split, len(items))
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--md-root", type=Path, required=True, help="Directory containing per-molecule trajectory folders")
+    parser.add_argument("--out-root", type=Path, required=True, help="Directory to write dataset npz files")
+    parser.add_argument("--splits-dir", type=Path, required=True, help="Directory for JSON splits")
+    parser.add_argument("--ks", nargs="+", type=int, default=[4, 8, 12], help="List of k-step horizons")
+    parser.add_argument("--stride", type=int, default=10, help="Frame stride when sampling windows")
+    parser.add_argument("--max-samples-per-mol", type=int, default=10000, help="Cap samples per molecule per k")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--augment-rotations",
+        type=int,
+        default=0,
+        help="Number of random rotations to apply per sampled window (data augmentation)",
+    )
+    return parser
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    configure_logging()
+    set_seed(args.seed)
+
+    trajectory_dirs = sorted([p for p in args.md_root.iterdir() if p.is_dir()])
+    if not trajectory_dirs:
+        raise RuntimeError(f"No trajectory directories found in {args.md_root}")
+
+    molecule_names = [p.name for p in trajectory_dirs]
+    _build_splits(molecule_names, args.splits_dir, args.seed)
+
+    for k in args.ks:
+        samples: List[Dict] = []
+        molecule_ids: List[str] = []
+        for mol_dir in trajectory_dirs:
+            npz_path = mol_dir / "trajectory.npz"
+            if not npz_path.exists():
+                LOGGER.warning("Missing trajectory for %s", mol_dir.name)
+                continue
+            traj = _load_trajectory(npz_path)
+            num_frames = traj["pos"].shape[0]
+            window_indices = list(_enumerate_windows(num_frames, k, args.stride))
+            if args.max_samples_per_mol > 0 and len(window_indices) > args.max_samples_per_mol:
+                window_indices = list(np.random.choice(window_indices, args.max_samples_per_mol, replace=False))
+            for idx in window_indices:
+                samples.append(_process_window(traj, idx, k))
+                molecule_ids.append(mol_dir.name)
+                if args.augment_rotations > 0:
+                    base_sample = samples[-1]
+                    for _ in range(args.augment_rotations):
+                        rotation = _random_rotation_matrix()
+                        samples.append(_apply_rotation(base_sample, rotation))
+                        molecule_ids.append(mol_dir.name)
+        out_path = args.out_root / f"dataset_k{k}.npz"
+        _save_dataset(samples, out_path, molecule_ids, k)
 
 
 if __name__ == "__main__":
     main()
-
