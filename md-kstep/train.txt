@@ -1,0 +1,1 @@
+python src/04_train.py --dataset data/md/dataset_k4.npz --model-config configs/model.yaml --train-config configs/train.yaml --splits data/splits/train.json data/splits/val.json --device cuda
