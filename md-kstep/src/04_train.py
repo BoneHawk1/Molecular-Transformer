@@ -31,6 +31,9 @@ sys.modules[_spec.name] = _module  # ensure dataclasses can resolve module
 _spec.loader.exec_module(_module)  # type: ignore[attr-defined]
 build_model_from_config = _module.build_model_from_config  # type: ignore[attr-defined]
 
+# Global cache for structural index tensors per molecule
+STRUCT_INDEXES: Dict[str, Dict[str, np.ndarray]] = {}
+
 
 @dataclass
 class TrainConfig:
@@ -108,6 +111,31 @@ class KStepDataset(Dataset):
         self.pos_std = float(max(self.pos_std, 1e-3))
         self.vel_std = float(max(self.vel_std, 1e-2))
 
+        # Precompute structural index maps once per molecule to avoid per-step CPU work
+        self.struct_index: Dict[str, Dict[str, np.ndarray]] = {}
+        seen: set[str] = set()
+        for idx in range(len(self.x_t)):
+            mol = str(self.molecule[idx])
+            if mol in seen:
+                continue
+            seen.add(mol)
+            xt_ref = self.x_t[idx]
+            types_ref = self.atom_types[idx]
+            bonds = self._np_guess_bonds(xt_ref, types_ref)
+            angles = self._np_build_angles(bonds)
+            dihedrals = self._np_build_dihedrals(bonds)
+            self.struct_index[mol] = {
+                "bonds_i": np.array([i for i, _ in bonds], dtype=np.int64),
+                "bonds_j": np.array([j for _, j in bonds], dtype=np.int64),
+                "ang_i": np.array([i for i, _, _ in angles], dtype=np.int64),
+                "ang_j": np.array([j for _, j, _ in angles], dtype=np.int64),
+                "ang_k": np.array([k for _, _, k in angles], dtype=np.int64),
+                "dih_a": np.array([a for a, _, _, _ in dihedrals], dtype=np.int64),
+                "dih_b": np.array([b for _, b, _, _ in dihedrals], dtype=np.int64),
+                "dih_c": np.array([c for _, _, c, _ in dihedrals], dtype=np.int64),
+                "dih_d": np.array([d for _, _, _, d in dihedrals], dtype=np.int64),
+            }
+
     def __len__(self) -> int:
         return len(self.x_t)
 
@@ -119,8 +147,69 @@ class KStepDataset(Dataset):
             "v_tk": self.v_tk[idx],
             "masses": self.masses[idx],
             "atom_types": self.atom_types[idx],
-            "molecule": self.molecule[idx],
+            "molecule": str(self.molecule[idx]),
         }
+
+    # ------- numpy-based index builders (run once per molecule) -------
+    @staticmethod
+    def _np_guess_bonds(x_nm: np.ndarray, atom_types: np.ndarray, tol_angstrom: float = 0.1) -> List[Tuple[int, int]]:
+        x_A = x_nm * 10.0
+        N = x_A.shape[0]
+        radii = np.array([_COVALENT_RADII.get(int(t), 0.75) for t in atom_types], dtype=np.float32)
+        ri = radii.reshape(-1, 1)
+        rj = radii.reshape(1, -1)
+        cutoff = ri + rj + tol_angstrom
+        diff = x_A[:, None, :] - x_A[None, :, :]
+        dist = np.linalg.norm(diff, axis=-1)
+        mask = (dist <= cutoff) & (~np.eye(N, dtype=bool))
+        ii, jj = np.where(mask)
+        bonds: List[Tuple[int, int]] = []
+        for i, j in zip(ii.tolist(), jj.tolist()):
+            if i < j:
+                bonds.append((i, j))
+        return bonds
+
+    @staticmethod
+    def _np_build_angles(bonds: List[Tuple[int, int]]) -> List[Tuple[int, int, int]]:
+        adj: Dict[int, List[int]] = {}
+        for i, j in bonds:
+            adj.setdefault(i, []).append(j)
+            adj.setdefault(j, []).append(i)
+        triples: List[Tuple[int, int, int]] = []
+        for center, neigh in adj.items():
+            L = len(neigh)
+            if L < 2:
+                continue
+            for a in range(L):
+                for b in range(a + 1, L):
+                    triples.append((neigh[a], center, neigh[b]))
+        return triples
+
+    @staticmethod
+    def _np_build_dihedrals(bonds: List[Tuple[int, int]]) -> List[Tuple[int, int, int, int]]:
+        adj: Dict[int, List[int]] = {}
+        for i, j in bonds:
+            adj.setdefault(i, []).append(j)
+            adj.setdefault(j, []).append(i)
+        quads: List[Tuple[int, int, int, int]] = []
+        for i, j in bonds:
+            for k in adj.get(j, []):
+                if k == i:
+                    continue
+                for l in adj.get(k, []):
+                    if l == j or l == i:
+                        continue
+                    quads.append((i, j, k, l))
+        seen = set()
+        uniq: List[Tuple[int, int, int, int]] = []
+        for a, b, c, d in quads:
+            key = (a, b, c, d)
+            rev = (d, c, b, a)
+            if key in seen or rev in seen:
+                continue
+            seen.add(key)
+            uniq.append(key)
+        return uniq
 
 
 def _collate(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -131,6 +220,7 @@ def _collate(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     v_tk = [torch.from_numpy(item["v_tk"]).to(device) for item in batch]
     masses = [torch.from_numpy(item["masses"]).to(device) for item in batch]
     atom_types = [torch.from_numpy(item["atom_types"]).long().to(device) for item in batch]
+    molecules: List[str] = [item["molecule"] for item in batch]
 
     node_counts = [item.shape[0] for item in x_t]
     batch_index = torch.cat([torch.full((count,), i, dtype=torch.long) for i, count in enumerate(node_counts)])
@@ -147,6 +237,7 @@ def _collate(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "atom_types": _cat(atom_types),
         "batch": batch_index,
         "node_slices": torch.tensor(node_counts, dtype=torch.long),
+        "molecule": molecules,
     }
 
 
@@ -185,7 +276,13 @@ def _momentum_loss(pred_vel: torch.Tensor, target_vel: torch.Tensor, masses: tor
 
 
 def _move_to(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
-    return {key: tensor.to(device) if torch.is_tensor(tensor) else tensor for key, tensor in batch.items()}
+    out: Dict[str, torch.Tensor] = {}
+    for key, val in batch.items():
+        if torch.is_tensor(val):
+            out[key] = val.to(device, non_blocking=True)
+        else:
+            out[key] = val
+    return out
 
 
 def _random_rotation_matrix(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -313,6 +410,7 @@ def _structural_losses(
     true_pos: torch.Tensor,
     atom_types: torch.Tensor,
     node_slices: torch.Tensor,
+    mol_names: List[str],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = pred_pos.device
     bond_loss_sum = torch.zeros((), device=device)
@@ -322,13 +420,38 @@ def _structural_losses(
     na = 0
     nd = 0
     start = 0
-    for count in node_slices.tolist():
+    for idx_graph, count in enumerate(node_slices.tolist()):
         end = start + count
         xh = pred_pos[start:end]
         xt = true_pos[start:end]
-        types = atom_types[start:end]
-        bonds = _guess_bonds_indices(xt, types)
-        if bonds:
+        mol = mol_names[idx_graph]
+        # Fetch precomputed indices for this molecule; fallback to on-the-fly if absent
+        idxs = STRUCT_INDEXES.get(mol)
+        if idxs is None:
+            types = atom_types[start:end]
+            bonds = _guess_bonds_indices(xt, types)
+            angles = _build_angles_from_bonds(bonds) if bonds else []
+            dihedrals = _build_dihedrals_from_bonds(bonds) if bonds else []
+            bi = torch.as_tensor([i for i, _ in bonds], device=device, dtype=torch.long) if bonds else torch.tensor([], device=device, dtype=torch.long)
+            bj = torch.as_tensor([j for _, j in bonds], device=device, dtype=torch.long) if bonds else torch.tensor([], device=device, dtype=torch.long)
+            ai = torch.as_tensor([i for i, _, _ in angles], device=device, dtype=torch.long) if angles else torch.tensor([], device=device, dtype=torch.long)
+            aj = torch.as_tensor([j for _, j, _ in angles], device=device, dtype=torch.long) if angles else torch.tensor([], device=device, dtype=torch.long)
+            ak = torch.as_tensor([k for _, j, k in angles], device=device, dtype=torch.long) if angles else torch.tensor([], device=device, dtype=torch.long)
+            da = torch.as_tensor([a for a, _, _, _ in dihedrals], device=device, dtype=torch.long) if dihedrals else torch.tensor([], device=device, dtype=torch.long)
+            db = torch.as_tensor([b for _, b, _, _ in dihedrals], device=device, dtype=torch.long) if dihedrals else torch.tensor([], device=device, dtype=torch.long)
+            dc = torch.as_tensor([c for _, _, c, _ in dihedrals], device=device, dtype=torch.long) if dihedrals else torch.tensor([], device=device, dtype=torch.long)
+            dd = torch.as_tensor([d for _, _, _, d in dihedrals], device=device, dtype=torch.long) if dihedrals else torch.tensor([], device=device, dtype=torch.long)
+        else:
+            bi = torch.as_tensor(idxs["bonds_i"], device=device, dtype=torch.long)
+            bj = torch.as_tensor(idxs["bonds_j"], device=device, dtype=torch.long)
+            ai = torch.as_tensor(idxs["ang_i"], device=device, dtype=torch.long)
+            aj = torch.as_tensor(idxs["ang_j"], device=device, dtype=torch.long)
+            ak = torch.as_tensor(idxs["ang_k"], device=device, dtype=torch.long)
+            da = torch.as_tensor(idxs["dih_a"], device=device, dtype=torch.long)
+            db = torch.as_tensor(idxs["dih_b"], device=device, dtype=torch.long)
+            dc = torch.as_tensor(idxs["dih_c"], device=device, dtype=torch.long)
+            dd = torch.as_tensor(idxs["dih_d"], device=device, dtype=torch.long)
+        if bi.numel() > 0:
             i_idx = torch.as_tensor([i for i, _ in bonds], device=device, dtype=torch.long)
             j_idx = torch.as_tensor([j for _, j in bonds], device=device, dtype=torch.long)
             # Bond lengths in Å for a stable scale
@@ -339,11 +462,8 @@ def _structural_losses(
             bl_true = bond_lengths(xt)
             bond_loss_sum = bond_loss_sum + torch.mean((bl_pred - bl_true) ** 2)
             nb += 1
-        angles = _build_angles_from_bonds(bonds) if bonds else []
-        if angles:
-            ii = torch.as_tensor([i for i, _, _ in angles], device=device, dtype=torch.long)
-            jj = torch.as_tensor([j for _, j, _ in angles], device=device, dtype=torch.long)
-            kk = torch.as_tensor([k for _, _, k in angles], device=device, dtype=torch.long)
+        if ai.numel() > 0:
+            ii = ai; jj = aj; kk = ak
             def angles_deg(x):
                 v1 = x[ii] - x[jj]
                 v2 = x[kk] - x[jj]
@@ -355,16 +475,12 @@ def _structural_losses(
             ang_true = angles_deg(xt)
             angle_loss_sum = angle_loss_sum + torch.mean((ang_pred - ang_true) ** 2)
             na += 1
-        dihedrals = _build_dihedrals_from_bonds(bonds) if bonds else []
-        if dihedrals:
-            ai = torch.as_tensor([a for a, _, _, _ in dihedrals], device=device, dtype=torch.long)
-            aj = torch.as_tensor([b for _, b, _, _ in dihedrals], device=device, dtype=torch.long)
-            ak = torch.as_tensor([c for _, _, c, _ in dihedrals], device=device, dtype=torch.long)
-            al = torch.as_tensor([d for _, _, _, d in dihedrals], device=device, dtype=torch.long)
+        if da.numel() > 0:
+            ai2 = da; aj2 = db; ak2 = dc; al2 = dd
             def dihed_deg(x):
-                b0 = x[aj] - x[ai]
-                b1 = x[ak] - x[aj]
-                b2 = x[al] - x[ak]
+                b0 = x[aj2] - x[ai2]
+                b1 = x[ak2] - x[aj2]
+                b2 = x[al2] - x[ak2]
                 b1n = b1 / (torch.linalg.norm(b1, dim=-1, keepdim=True) + 1e-9)
                 v = b0 - (b0 * b1n).sum(dim=-1, keepdim=True) * b1n
                 w = b2 - (b2 * b1n).sum(dim=-1, keepdim=True) * b1n
@@ -406,7 +522,7 @@ def run_validation(
             # Optional structural penalties (use small weights; computed on positions only)
             if cfg.lambda_struct_bond > 0 or cfg.lambda_struct_angle > 0 or cfg.lambda_struct_dihedral > 0:
                 b_loss, a_loss, d_loss = _structural_losses(
-                    pred_pos, batch["x_tk"], batch["atom_types"], batch["node_slices"]
+                    pred_pos, batch["x_tk"], batch["atom_types"], batch["node_slices"], batch["molecule"]
                 )
                 loss = (
                     loss
@@ -469,6 +585,9 @@ def main() -> None:
 
     train_dataset = KStepDataset(args.dataset, train_split)
     val_dataset = KStepDataset(args.dataset, val_split)
+    # Expose structural index cache globally for quick lookup
+    global STRUCT_INDEXES
+    STRUCT_INDEXES = train_dataset.struct_index
     pos_std = float(train_dataset.pos_std)
     vel_std = float(train_dataset.vel_std)
 
@@ -484,6 +603,8 @@ def main() -> None:
         num_workers=train_cfg.num_workers,
         collate_fn=_collate,
         pin_memory=True,
+        persistent_workers=True if train_cfg.num_workers > 0 else False,
+        prefetch_factor=4 if train_cfg.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -492,6 +613,8 @@ def main() -> None:
         num_workers=train_cfg.num_workers,
         collate_fn=_collate,
         pin_memory=True,
+        persistent_workers=True if train_cfg.num_workers > 0 else False,
+        prefetch_factor=2 if train_cfg.num_workers > 0 else None,
     )
 
     optimizer = AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
@@ -528,7 +651,7 @@ def main() -> None:
                     or train_cfg.lambda_struct_dihedral > 0
                 ):
                     b_loss, a_loss, d_loss = _structural_losses(
-                        pred_pos, batch["x_tk"], batch["atom_types"], batch["node_slices"]
+                        pred_pos, batch["x_tk"], batch["atom_types"], batch["node_slices"], batch["molecule"]
                     )
                     loss = (
                         loss
