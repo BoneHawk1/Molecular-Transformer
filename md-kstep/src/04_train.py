@@ -56,6 +56,10 @@ class TrainConfig:
     resume: str | None
     wandb: Dict
     random_rotate: bool
+    # Structural penalties (small weights recommended)
+    lambda_struct_bond: float = 0.0
+    lambda_struct_angle: float = 0.0
+    lambda_struct_dihedral: float = 0.0
 
     @classmethod
     def from_dict(cls, data: Dict) -> "TrainConfig":
@@ -83,6 +87,26 @@ class KStepDataset(Dataset):
             self.masses = self.masses[mask]
             self.atom_types = self.atom_types[mask]
             self.molecule = self.molecule[mask]
+
+        # Compute global std for deltas (for normalization in the loss)
+        # Use scalar std across all components for stability
+        pos_sq_sum = 0.0
+        vel_sq_sum = 0.0
+        count_pos = 0
+        count_vel = 0
+        for xt, xtk, vt, vtk in zip(self.x_t, self.x_tk, self.v_t, self.v_tk):
+            dp = (xtk - xt).astype(np.float64)
+            dv = (vtk - vt).astype(np.float64)
+            pos_sq_sum += float(np.sum(dp * dp))
+            vel_sq_sum += float(np.sum(dv * dv))
+            count_pos += dp.size
+            count_vel += dv.size
+        # Avoid division by zero
+        self.pos_std: float = float(np.sqrt(pos_sq_sum / max(count_pos, 1)))
+        self.vel_std: float = float(np.sqrt(vel_sq_sum / max(count_vel, 1)))
+        # Clamp to sensible minima to avoid over-amplifying the loss
+        self.pos_std = float(max(self.pos_std, 1e-3))
+        self.vel_std = float(max(self.vel_std, 1e-2))
 
     def __len__(self) -> int:
         return len(self.x_t)
@@ -200,7 +224,173 @@ def _apply_random_rotations(batch: Dict[str, torch.Tensor]) -> None:
         start = end
 
 
-def run_validation(model: nn.Module, loader: DataLoader, device: torch.device, cfg: TrainConfig) -> Dict[str, float]:
+# --- Structural penalties utilities (torch) ---
+
+# Covalent radii in Å (subset sufficient for this dataset)
+_COVALENT_RADII = {
+    1: 0.31,
+    6: 0.76,
+    7: 0.71,
+    8: 0.66,
+    9: 0.57,
+    15: 1.07,
+    16: 1.05,
+    17: 1.02,
+}
+
+
+def _guess_bonds_indices(x_nm: torch.Tensor, atom_types: torch.Tensor, tol_angstrom: float = 0.1) -> List[Tuple[int, int]]:
+    # x_nm: (N,3) on the current device
+    device = x_nm.device
+    x_A = x_nm * 10.0
+    N = x_A.shape[0]
+    # Map atom_types to radii (fallback 0.75 Å)
+    types_np = atom_types.detach().cpu().numpy().astype(int)
+    radii_np = np.array([_COVALENT_RADII.get(t, 0.75) for t in types_np], dtype=np.float32)
+    radii = torch.as_tensor(radii_np, device=device)
+    # Pairwise thresholds
+    ri = radii.view(-1, 1)
+    rj = radii.view(1, -1)
+    cutoff = ri + rj + tol_angstrom
+    # Distances
+    diff = x_A.unsqueeze(1) - x_A.unsqueeze(0)  # (N,N,3)
+    dist = torch.linalg.norm(diff, dim=-1)  # (N,N)
+    mask = (dist <= cutoff) & (~torch.eye(N, dtype=torch.bool, device=device))
+    idx = torch.nonzero(mask, as_tuple=False)
+    # Unique undirected pairs i<j
+    pairs: List[Tuple[int, int]] = []
+    for i, j in idx.tolist():
+        if i < j:
+            pairs.append((i, j))
+    return pairs
+
+
+def _build_angles_from_bonds(bonds: List[Tuple[int, int]]) -> List[Tuple[int, int, int]]:
+    adj: Dict[int, List[int]] = {}
+    for i, j in bonds:
+        adj.setdefault(i, []).append(j)
+        adj.setdefault(j, []).append(i)
+    triples: List[Tuple[int, int, int]] = []
+    for center, neigh in adj.items():
+        L = len(neigh)
+        if L < 2:
+            continue
+        for a in range(L):
+            for b in range(a + 1, L):
+                triples.append((neigh[a], center, neigh[b]))
+    return triples
+
+
+def _build_dihedrals_from_bonds(bonds: List[Tuple[int, int]]) -> List[Tuple[int, int, int, int]]:
+    adj: Dict[int, List[int]] = {}
+    for i, j in bonds:
+        adj.setdefault(i, []).append(j)
+        adj.setdefault(j, []).append(i)
+    quads: List[Tuple[int, int, int, int]] = []
+    for i, j in bonds:
+        for k in adj.get(j, []):
+            if k == i:
+                continue
+            for l in adj.get(k, []):
+                if l == j or l == i:
+                    continue
+                quads.append((i, j, k, l))
+    # Deduplicate by canonical key
+    seen = set()
+    uniq: List[Tuple[int, int, int, int]] = []
+    for a, b, c, d in quads:
+        key = (a, b, c, d)
+        rev = (d, c, b, a)
+        if key in seen or rev in seen:
+            continue
+        seen.add(key)
+        uniq.append(key)
+    return uniq
+
+
+def _structural_losses(
+    pred_pos: torch.Tensor,
+    true_pos: torch.Tensor,
+    atom_types: torch.Tensor,
+    node_slices: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = pred_pos.device
+    bond_loss_sum = torch.zeros((), device=device)
+    angle_loss_sum = torch.zeros((), device=device)
+    dihedral_loss_sum = torch.zeros((), device=device)
+    nb = 0
+    na = 0
+    nd = 0
+    start = 0
+    for count in node_slices.tolist():
+        end = start + count
+        xh = pred_pos[start:end]
+        xt = true_pos[start:end]
+        types = atom_types[start:end]
+        bonds = _guess_bonds_indices(xt, types)
+        if bonds:
+            i_idx = torch.as_tensor([i for i, _ in bonds], device=device, dtype=torch.long)
+            j_idx = torch.as_tensor([j for _, j in bonds], device=device, dtype=torch.long)
+            # Bond lengths in Å for a stable scale
+            def bond_lengths(x):
+                d = x[i_idx] - x[j_idx]
+                return torch.linalg.norm(d, dim=-1) * 10.0
+            bl_pred = bond_lengths(xh)
+            bl_true = bond_lengths(xt)
+            bond_loss_sum = bond_loss_sum + torch.mean((bl_pred - bl_true) ** 2)
+            nb += 1
+        angles = _build_angles_from_bonds(bonds) if bonds else []
+        if angles:
+            ii = torch.as_tensor([i for i, _, _ in angles], device=device, dtype=torch.long)
+            jj = torch.as_tensor([j for _, j, _ in angles], device=device, dtype=torch.long)
+            kk = torch.as_tensor([k for _, _, k in angles], device=device, dtype=torch.long)
+            def angles_deg(x):
+                v1 = x[ii] - x[jj]
+                v2 = x[kk] - x[jj]
+                v1 = v1 / (torch.linalg.norm(v1, dim=-1, keepdim=True) + 1e-9)
+                v2 = v2 / (torch.linalg.norm(v2, dim=-1, keepdim=True) + 1e-9)
+                cos = torch.clamp((v1 * v2).sum(dim=-1), -1.0, 1.0)
+                return torch.acos(cos) * (180.0 / math.pi)
+            ang_pred = angles_deg(xh)
+            ang_true = angles_deg(xt)
+            angle_loss_sum = angle_loss_sum + torch.mean((ang_pred - ang_true) ** 2)
+            na += 1
+        dihedrals = _build_dihedrals_from_bonds(bonds) if bonds else []
+        if dihedrals:
+            ai = torch.as_tensor([a for a, _, _, _ in dihedrals], device=device, dtype=torch.long)
+            aj = torch.as_tensor([b for _, b, _, _ in dihedrals], device=device, dtype=torch.long)
+            ak = torch.as_tensor([c for _, _, c, _ in dihedrals], device=device, dtype=torch.long)
+            al = torch.as_tensor([d for _, _, _, d in dihedrals], device=device, dtype=torch.long)
+            def dihed_deg(x):
+                b0 = x[aj] - x[ai]
+                b1 = x[ak] - x[aj]
+                b2 = x[al] - x[ak]
+                b1n = b1 / (torch.linalg.norm(b1, dim=-1, keepdim=True) + 1e-9)
+                v = b0 - (b0 * b1n).sum(dim=-1, keepdim=True) * b1n
+                w = b2 - (b2 * b1n).sum(dim=-1, keepdim=True) * b1n
+                xnum = (v * w).sum(dim=-1)
+                yden = torch.linalg.norm(torch.cross(v, b1n, dim=-1), dim=-1) * (torch.linalg.norm(w, dim=-1) + 1e-9)
+                ang = torch.atan2(yden, xnum + 1e-9) * (180.0 / math.pi)
+                return ang
+            dih_pred = dihed_deg(xh)
+            dih_true = dihed_deg(xt)
+            dihedral_loss_sum = dihedral_loss_sum + torch.mean((dih_pred - dih_true) ** 2)
+            nd += 1
+        start = end
+    bond_loss = bond_loss_sum / max(nb, 1)
+    angle_loss = angle_loss_sum / max(na, 1)
+    dihedral_loss = dihedral_loss_sum / max(nd, 1)
+    return bond_loss, angle_loss, dihedral_loss
+
+
+def run_validation(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    cfg: TrainConfig,
+    pos_std: float,
+    vel_std: float,
+) -> Dict[str, float]:
     model.eval()
     losses = []
     with torch.inference_mode():
@@ -209,9 +399,21 @@ def run_validation(model: nn.Module, loader: DataLoader, device: torch.device, c
             outputs = model(batch)
             pred_pos = batch["x_t"] + outputs["delta_pos"]
             pred_vel = batch["v_t"] + outputs["delta_vel"]
-            loss_pos = torch.mean((pred_pos - batch["x_tk"]) ** 2)
-            loss_vel = torch.mean((pred_vel - batch["v_tk"]) ** 2)
+            # Standardized delta losses
+            loss_pos = torch.mean(((pred_pos - batch["x_t"]) / pos_std - (batch["x_tk"] - batch["x_t"]) / pos_std) ** 2)
+            loss_vel = torch.mean(((pred_vel - batch["v_t"]) / vel_std - (batch["v_tk"] - batch["v_t"]) / vel_std) ** 2)
             loss = loss_pos + cfg.lambda_vel * loss_vel
+            # Optional structural penalties (use small weights; computed on positions only)
+            if cfg.lambda_struct_bond > 0 or cfg.lambda_struct_angle > 0 or cfg.lambda_struct_dihedral > 0:
+                b_loss, a_loss, d_loss = _structural_losses(
+                    pred_pos, batch["x_tk"], batch["atom_types"], batch["node_slices"]
+                )
+                loss = (
+                    loss
+                    + cfg.lambda_struct_bond * b_loss
+                    + cfg.lambda_struct_angle * a_loss
+                    + cfg.lambda_struct_dihedral * d_loss
+                )
             losses.append(loss.item())
     model.train()
     return {"val_loss": float(np.mean(losses)) if losses else float("nan")}
@@ -267,6 +469,8 @@ def main() -> None:
 
     train_dataset = KStepDataset(args.dataset, train_split)
     val_dataset = KStepDataset(args.dataset, val_split)
+    pos_std = float(train_dataset.pos_std)
+    vel_std = float(train_dataset.vel_std)
 
     device = torch.device(args.device)
 
@@ -313,9 +517,25 @@ def main() -> None:
                 outputs = model(batch)
                 pred_pos = batch["x_t"] + outputs["delta_pos"]
                 pred_vel = batch["v_t"] + outputs["delta_vel"]
-                loss_pos = torch.mean((pred_pos - batch["x_tk"]) ** 2)
-                loss_vel = torch.mean((pred_vel - batch["v_tk"]) ** 2)
+                # Standardized delta losses (per-component scalar std)
+                loss_pos = torch.mean(((pred_pos - batch["x_t"]) / pos_std - (batch["x_tk"] - batch["x_t"]) / pos_std) ** 2)
+                loss_vel = torch.mean(((pred_vel - batch["v_t"]) / vel_std - (batch["v_tk"] - batch["v_t"]) / vel_std) ** 2)
                 loss = loss_pos + train_cfg.lambda_vel * loss_vel
+                # Structural penalties
+                if (
+                    train_cfg.lambda_struct_bond > 0
+                    or train_cfg.lambda_struct_angle > 0
+                    or train_cfg.lambda_struct_dihedral > 0
+                ):
+                    b_loss, a_loss, d_loss = _structural_losses(
+                        pred_pos, batch["x_tk"], batch["atom_types"], batch["node_slices"]
+                    )
+                    loss = (
+                        loss
+                        + train_cfg.lambda_struct_bond * b_loss
+                        + train_cfg.lambda_struct_angle * a_loss
+                        + train_cfg.lambda_struct_dihedral * d_loss
+                    )
                 if train_cfg.lambda_com > 0:
                     com_pos_loss = _com_loss(pred_pos, batch["x_tk"], batch["masses"], batch["batch"])
                     momentum_loss = _momentum_loss(pred_vel, batch["v_tk"], batch["masses"], batch["batch"])
@@ -353,7 +573,7 @@ def main() -> None:
             global_step += 1
 
             if train_cfg.val_every_steps > 0 and global_step % train_cfg.val_every_steps == 0:
-                metrics = run_validation(model, val_loader, device, train_cfg)
+                metrics = run_validation(model, val_loader, device, train_cfg, pos_std, vel_std)
                 LOGGER.info("Step %d: val_loss=%.6f", global_step, metrics["val_loss"])
                 val_metrics.append({
                     "step": int(global_step),

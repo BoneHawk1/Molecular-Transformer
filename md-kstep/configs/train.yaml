@@ -13,6 +13,9 @@ grad_clip: 1.0
 lambda_vel: 1.25
 lambda_com: 1.0e-1
 lambda_force: 0.0
+lambda_struct_bond: 5.0e-2
+lambda_struct_angle: 1.0e-2
+lambda_struct_dihedral: 5.0e-3
 val_every_steps: 100
 checkpoint_every_steps: 1000
 checkpoint_dir: outputs/checkpoints_aug_wide
