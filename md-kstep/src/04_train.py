@@ -654,6 +654,21 @@ def main() -> None:
     train_cfg = TrainConfig.from_dict(load_yaml(args.train_config))
     set_seed(train_cfg.seed)
 
+    # Redirect checkpoints for transformer architecture to a dedicated folder
+    try:
+        arch = str(model_cfg.get("arch", "egnn")).lower()
+        if arch in ("transformer_egnn", "attention_egnn", "egnn_transformer"):
+            ckpt_dir = Path(train_cfg.checkpoint_dir)
+            name = ckpt_dir.name
+            if name.startswith("checkpoints"):
+                new_name = name.replace("checkpoints", "checkpoints_transformer", 1)
+                ckpt_dir = ckpt_dir.with_name(new_name)
+            else:
+                ckpt_dir = ckpt_dir.parent / "checkpoints_transformer"
+            train_cfg.checkpoint_dir = str(ckpt_dir)
+    except Exception:
+        pass
+
     log_dir = Path(train_cfg.log_dir)
     ensure_dir(log_dir)
     train_log_path = log_dir / "train_metrics.jsonl"

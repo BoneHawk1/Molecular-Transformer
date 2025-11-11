@@ -1,0 +1,26 @@
+seed: 42
+k_steps: 4
+batch_size: 4
+grad_accum: 1
+num_workers: 0
+lr: 2.0e-4
+lr_min: 2.0e-4
+weight_decay: 0.0
+max_epochs: 1
+steps_per_epoch: 10
+amp: false
+grad_clip: 1.0
+lambda_vel: 0.5
+lambda_com: 0.0
+lambda_force: 0.0
+val_every_steps: 10
+checkpoint_every_steps: 0
+checkpoint_dir: outputs/checkpoints_debug
+log_dir: outputs/logs_debug
+resume: null
+wandb:
+  enabled: false
+  project: md-kstep
+  entity: null
+  run_name: null
+random_rotate: false

@@ -32,6 +32,7 @@ class MDConfig:
     dt_fs: float
     temperature_K: float
     friction_per_ps: float
+    save_interval_steps: int
     platform: str
     constraints: str
     random_seed: int
@@ -45,6 +46,7 @@ class MDConfig:
             dt_fs=cfg.get("dt_fs", 2.0),
             temperature_K=cfg.get("temperature_K", 300.0),
              friction_per_ps=cfg.get("friction_per_ps", 1.0),
+            save_interval_steps=int(cfg.get("save_interval_steps", 50)),
             platform=cfg.get("platform", "CUDA"),
             constraints=cfg.get("constraints", "HBonds"),
             random_seed=cfg.get("random_seed", 42),
@@ -200,9 +202,17 @@ def run_hybrid(model: torch.nn.Module, md_cfg: MDConfig, molecule_dir: Path, md_
 
     force_calls = 0
     nve_windows = []
+    # Convert configured NVE durations (ps) to base integrator steps
     nve_window_steps = int((md_cfg.nve_window_ps * 1000) / md_cfg.dt_fs) if md_cfg.nve_window_ps > 0 else 0
     nve_every_steps = int((md_cfg.nve_every_ps * 1000) / md_cfg.dt_fs) if md_cfg.nve_every_ps > 0 else 0
-    corrector_steps = max(1, k_steps)
+    # Corrector cadence: by default, use a small fraction of baseline steps
+    # Baseline steps per macro-step = k_steps * save_interval_steps
+    baseline_steps = max(1, k_steps * md_cfg.save_interval_steps)
+    if hasattr(run_hybrid, "_corrector_override") and isinstance(run_hybrid._corrector_override, int):  # type: ignore[attr-defined]
+        corrector_steps = max(1, int(run_hybrid._corrector_override))
+    else:
+        corrector_steps = max(1, int(baseline_steps * getattr(run_hybrid, "_corrector_fraction", 0.05)))  # type: ignore[attr-defined]
+    LOGGER.info("Corrector cadence: %d micro-steps per macro-step (baseline %d)", corrector_steps, baseline_steps)
 
     for step_idx in range(steps):
         with torch.no_grad():
@@ -273,7 +283,7 @@ def run_hybrid(model: torch.nn.Module, md_cfg: MDConfig, molecule_dir: Path, md_
 
         # Optionally run an NVE window at configured cadence (measured in base steps)
         if nve_window_steps > 0 and nve_every_steps > 0:
-            base_steps_elapsed = (step_idx + 1) * k_steps
+            base_steps_elapsed = (step_idx + 1) * corrector_steps
             if base_steps_elapsed % nve_every_steps == 0 or step_idx == 0:
                 win = _run_nve_window(
                     molecule_dir,
@@ -290,7 +300,7 @@ def run_hybrid(model: torch.nn.Module, md_cfg: MDConfig, molecule_dir: Path, md_
     if baseline_time is not None and len(baseline_time) >= frame + steps + 1:
         time_ps = np.asarray(baseline_time[frame:frame + steps + 1], dtype=np.float32)
     else:
-        dt_ps = md_cfg.dt_fs * k_steps * 1e-3
+        dt_ps = md_cfg.dt_fs * md_cfg.save_interval_steps * k_steps * 1e-3
         time_ps = np.arange(steps + 1, dtype=np.float32) * dt_ps
 
     return {
@@ -327,6 +337,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-attempts", type=int, default=3, help="Attempts to shrink the learned update before falling back")
     parser.add_argument("--pos-threshold", type=float, default=2.0, help="Abort if |x| exceeds this limit (nm)")
     parser.add_argument("--vel-threshold", type=float, default=8.0, help="Abort if |v| exceeds this limit (nm/ps)")
+    # Corrector cadence controls
+    parser.add_argument("--corrector-steps", type=int, default=0, help="If >0, number of OpenMM micro-steps per macro-step (accelerates when < baseline)")
+    parser.add_argument("--corrector-fraction", type=float, default=0.05, help="Fraction of baseline steps to spend in corrector if --corrector-steps == 0")
     return parser
 
 
@@ -340,6 +353,14 @@ def main() -> None:
     model_cfg = load_yaml(args.model_config)
     model = load_model(args.checkpoint, model_cfg, device)
     md_cfg = MDConfig.from_yaml(args.md_config)
+
+    # Communicate corrector cadence choice to run_hybrid via function attributes (avoids changing signature)
+    if args.corrector_steps and args.corrector_steps > 0:
+        run_hybrid._corrector_override = int(args.corrector_steps)  # type: ignore[attr-defined]
+        run_hybrid._corrector_fraction = float(args.corrector_fraction)  # type: ignore[attr-defined]
+    else:
+        run_hybrid._corrector_override = None  # type: ignore[attr-defined]
+        run_hybrid._corrector_fraction = float(args.corrector_fraction)  # type: ignore[attr-defined]
 
     start = time.perf_counter()
     results = run_hybrid(
@@ -360,7 +381,7 @@ def main() -> None:
     )
     wall_clock = time.perf_counter() - start
 
-    baseline_force_calls = args.steps * args.k_steps
+    baseline_force_calls = args.steps * args.k_steps * md_cfg.save_interval_steps
     savings = baseline_force_calls / max(results["force_calls"], 1)
 
     metadata = {
@@ -371,6 +392,8 @@ def main() -> None:
         "force_calls_hybrid": results["force_calls"],
         "force_calls_baseline": baseline_force_calls,
         "force_call_savings": savings,
+        "corrector_steps": int(getattr(run_hybrid, "_corrector_override", 0) or max(1, int(args.k_steps * md_cfg.save_interval_steps * float(getattr(run_hybrid, "_corrector_fraction", 0.05))))),
+        "corrector_fraction": float(getattr(run_hybrid, "_corrector_fraction", 0.05)),
         "initial_metadata": results["metadata"],
     }
 
