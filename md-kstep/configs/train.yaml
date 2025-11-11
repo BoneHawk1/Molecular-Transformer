@@ -1,6 +1,6 @@
 seed: 42
 k_steps: 4
-batch_size: 32
+batch_size: 512
 grad_accum: 4
 num_workers: 4
 lr: 1.0e-4
@@ -27,3 +27,7 @@ wandb:
   entity: null
   run_name: null
 random_rotate: true
+random_rotate_mode: batch
+struct_max_bonds: 256
+struct_max_angles: 256
+struct_max_dihedrals: 256
