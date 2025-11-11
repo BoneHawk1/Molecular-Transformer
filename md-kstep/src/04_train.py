@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -54,6 +55,7 @@ class TrainConfig:
     log_dir: str
     resume: str | None
     wandb: Dict
+    random_rotate: bool
 
     @classmethod
     def from_dict(cls, data: Dict) -> "TrainConfig":
@@ -162,6 +164,42 @@ def _move_to(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, 
     return {key: tensor.to(device) if torch.is_tensor(tensor) else tensor for key, tensor in batch.items()}
 
 
+def _random_rotation_matrix(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    # Shoemake (1992) uniform quaternions
+    u1 = torch.rand((), device=device, dtype=dtype)
+    u2 = torch.rand((), device=device, dtype=dtype)
+    u3 = torch.rand((), device=device, dtype=dtype)
+    sqrt_u1 = torch.sqrt(u1)
+    sqrt_one_minus_u1 = torch.sqrt(1 - u1)
+    theta1 = 2 * math.pi * u2
+    theta2 = 2 * math.pi * u3
+    x = sqrt_one_minus_u1 * torch.sin(theta1)
+    y = sqrt_one_minus_u1 * torch.cos(theta1)
+    z = sqrt_u1 * torch.sin(theta2)
+    w = sqrt_u1 * torch.cos(theta2)
+    rot = torch.stack([
+        torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)]),
+        torch.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)]),
+        torch.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]),
+    ])
+    return rot.to(device=device, dtype=dtype)
+
+
+def _apply_random_rotations(batch: Dict[str, torch.Tensor]) -> None:
+    counts = batch["node_slices"].detach().cpu().tolist()
+    if not counts:
+        return
+    device = batch["x_t"].device
+    dtype = batch["x_t"].dtype
+    start = 0
+    for count in counts:
+        end = start + count
+        rot = _random_rotation_matrix(device, dtype)
+        for key in ("x_t", "v_t", "x_tk", "v_tk"):
+            batch[key][start:end] = batch[key][start:end] @ rot.T
+        start = end
+
+
 def run_validation(model: nn.Module, loader: DataLoader, device: torch.device, cfg: TrainConfig) -> Dict[str, float]:
     model.eval()
     losses = []
@@ -253,7 +291,9 @@ def main() -> None:
     )
 
     optimizer = AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=train_cfg.max_epochs * train_cfg.steps_per_epoch, eta_min=train_cfg.lr_min)
+    steps_per_epoch = max(len(train_loader), 1)
+    total_steps = train_cfg.max_epochs * steps_per_epoch
+    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=train_cfg.lr_min)
     scaler = GradScaler("cuda", enabled=train_cfg.amp)
 
     global_step = 0
@@ -264,6 +304,8 @@ def main() -> None:
         LOGGER.info("Epoch %d/%d", epoch + 1, train_cfg.max_epochs)
         for batch in train_loader:
             batch = _move_to(batch, device)
+            if train_cfg.random_rotate:
+                _apply_random_rotations(batch)
             com_pos_loss = None
             momentum_loss = None
             force_reg = None
@@ -340,9 +382,9 @@ def main() -> None:
                     "epoch": epoch,
                 }, checkpoint_path)
 
-            if global_step >= train_cfg.max_epochs * train_cfg.steps_per_epoch:
+            if global_step >= total_steps:
                 break
-        if global_step >= train_cfg.max_epochs * train_cfg.steps_per_epoch:
+        if global_step >= total_steps:
             break
 
     _write_jsonl(train_log_path, train_metrics)

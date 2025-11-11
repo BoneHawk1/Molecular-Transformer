@@ -12,10 +12,10 @@ from typing import Dict
 
 import numpy as np
 import torch
-from openmm import (Platform, VerletIntegrator, XmlSerializer, unit)
+from openmm import (LangevinIntegrator, Platform, VerletIntegrator, XmlSerializer, unit)
 from openmm.app import PDBFile, Simulation
 
-from utils import configure_logging, ensure_dir, load_yaml, set_seed, LOGGER
+from utils import configure_logging, ensure_dir, load_yaml, remove_com, set_seed, LOGGER
 
 SRC_DIR = Path(__file__).resolve().parent
 MODEL_PATH = SRC_DIR / "03_model.py"
@@ -31,6 +31,7 @@ build_model_from_config = _module.build_model_from_config  # type: ignore[attr-d
 class MDConfig:
     dt_fs: float
     temperature_K: float
+    friction_per_ps: float
     platform: str
     constraints: str
     random_seed: int
@@ -43,6 +44,7 @@ class MDConfig:
         return cls(
             dt_fs=cfg.get("dt_fs", 2.0),
             temperature_K=cfg.get("temperature_K", 300.0),
+             friction_per_ps=cfg.get("friction_per_ps", 1.0),
             platform=cfg.get("platform", "CUDA"),
             constraints=cfg.get("constraints", "HBonds"),
             random_seed=cfg.get("random_seed", 42),
@@ -85,7 +87,12 @@ def load_openmm_sim(molecule_dir: Path, md_cfg: MDConfig) -> Simulation:
     pdb = PDBFile(str(pdb_path))
     with xml_path.open("r", encoding="utf-8") as handle:
         system = XmlSerializer.deserialize(handle.read())
-    integrator = VerletIntegrator(md_cfg.dt_fs * unit.femtosecond)
+    integrator = LangevinIntegrator(
+        md_cfg.temperature_K * unit.kelvin,
+        md_cfg.friction_per_ps / unit.picosecond,
+        md_cfg.dt_fs * unit.femtosecond,
+    )
+    integrator.setRandomNumberSeed(md_cfg.random_seed)
     platform = Platform.getPlatformByName(md_cfg.platform)
     sim = Simulation(pdb.topology, system, integrator, platform)
     return sim
@@ -100,10 +107,18 @@ def _load_openmm_bundle(molecule_dir: Path):
     return pdb, system
 
 
-def apply_corrector(simulation: Simulation, positions_nm: np.ndarray, velocities_nm_per_ps: np.ndarray) -> Dict[str, np.ndarray]:
+def apply_corrector(
+    simulation: Simulation,
+    positions_nm: np.ndarray,
+    velocities_nm_per_ps: np.ndarray,
+    steps: int,
+) -> Dict[str, np.ndarray]:
     simulation.context.setPositions(positions_nm * unit.nanometer)
     simulation.context.setVelocities(velocities_nm_per_ps * (unit.nanometer / unit.picosecond))
-    simulation.step(1)
+    simulation.context.applyConstraints(1e-6)
+    simulation.context.applyVelocityConstraints(1e-6)
+    micro_steps = max(1, int(steps))
+    simulation.step(micro_steps)
     state = simulation.context.getState(getPositions=True, getVelocities=True, getEnergy=True)
     corrected_pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
     corrected_vel = state.getVelocities(asNumpy=True).value_in_unit(unit.nanometer / unit.picosecond)
@@ -143,20 +158,43 @@ def _run_nve_window(molecule_dir: Path, md_cfg: MDConfig,
     }
 
 
+def _limit_vector_norm(delta: torch.Tensor, limit: float) -> torch.Tensor:
+    if limit <= 0 or delta.numel() == 0:
+        return delta
+    norms = torch.linalg.norm(delta, dim=1, keepdim=True)
+    norms = torch.clamp(norms, min=1e-8)
+    scale = torch.clamp(limit / norms, max=1.0)
+    return delta * scale
+
+
+def _is_stable(pos: np.ndarray, vel: np.ndarray, pos_threshold: float, vel_threshold: float) -> bool:
+    if not np.all(np.isfinite(pos)) or not np.all(np.isfinite(vel)):
+        return False
+    if pos.size and float(np.abs(pos).max()) > pos_threshold:
+        return False
+    if vel.size and float(np.abs(vel).max()) > vel_threshold:
+        return False
+    return True
+
+
 def run_hybrid(model: torch.nn.Module, md_cfg: MDConfig, molecule_dir: Path, md_npz: Path, frame: int,
-               steps: int, k_steps: int, device: torch.device) -> Dict[str, np.ndarray]:
+               steps: int, k_steps: int, device: torch.device,
+               max_delta_pos: float, max_delta_vel: float, delta_scale: float,
+               max_attempts: int, pos_threshold: float, vel_threshold: float) -> Dict[str, np.ndarray]:
     state = load_initial_state(md_npz, frame)
-    positions = torch.from_numpy(state["positions"]).to(device)
-    velocities = torch.from_numpy(state["velocities"]).to(device)
-    masses = torch.from_numpy(state["masses"]).to(device)
+    masses_np = state["masses"].astype(np.float32)
+    positions_np, velocities_np = remove_com(state["positions"], state["velocities"], masses_np)
+    positions = torch.from_numpy(positions_np).to(device)
+    velocities = torch.from_numpy(velocities_np).to(device)
+    masses = torch.from_numpy(masses_np).to(device)
     atom_types = torch.from_numpy(state["atom_types"]).long().to(device)
 
     simulation = load_openmm_sim(molecule_dir, md_cfg)
     total_nodes = positions.shape[0]
     batch_index = torch.zeros(total_nodes, dtype=torch.long, device=device)
 
-    pos_records = [state["positions"].astype(np.float32)]
-    vel_records = [state["velocities"].astype(np.float32)]
+    pos_records = [positions_np.astype(np.float32)]
+    vel_records = [velocities_np.astype(np.float32)]
     Ekin = [np.nan]
     Epot = [np.nan]
 
@@ -164,6 +202,7 @@ def run_hybrid(model: torch.nn.Module, md_cfg: MDConfig, molecule_dir: Path, md_
     nve_windows = []
     nve_window_steps = int((md_cfg.nve_window_ps * 1000) / md_cfg.dt_fs) if md_cfg.nve_window_ps > 0 else 0
     nve_every_steps = int((md_cfg.nve_every_ps * 1000) / md_cfg.dt_fs) if md_cfg.nve_every_ps > 0 else 0
+    corrector_steps = max(1, k_steps)
 
     for step_idx in range(steps):
         with torch.no_grad():
@@ -177,18 +216,59 @@ def run_hybrid(model: torch.nn.Module, md_cfg: MDConfig, molecule_dir: Path, md_
             outputs = model(batch)
             delta_pos = outputs["delta_pos"]
             delta_vel = outputs["delta_vel"]
-            pred_pos = positions + delta_pos
-            pred_vel = velocities + delta_vel
+            delta_pos = _limit_vector_norm(delta_pos, max_delta_pos)
+            delta_vel = _limit_vector_norm(delta_vel, max_delta_vel)
 
-        correction = apply_corrector(simulation, pred_pos.detach().cpu().numpy(), pred_vel.detach().cpu().numpy())
-        positions = torch.from_numpy(correction["positions"]).to(device)
-        velocities = torch.from_numpy(correction["velocities"]).to(device)
+        delta_pos_np = delta_pos.detach().cpu().numpy()
+        delta_vel_np = delta_vel.detach().cpu().numpy()
+        current_pos_np = positions.detach().cpu().numpy()
+        current_vel_np = velocities.detach().cpu().numpy()
 
-        pos_records.append(correction["positions"])
-        vel_records.append(correction["velocities"])
+        attempts = 0
+        scale = delta_scale
+        success = False
+        correction = None
+        centered_pos = None
+        centered_vel = None
+        while attempts < max_attempts:
+            scaled_pos = current_pos_np + delta_pos_np * scale
+            scaled_vel = current_vel_np + delta_vel_np * scale
+            corr = apply_corrector(
+                simulation,
+                scaled_pos,
+                scaled_vel,
+                corrector_steps,
+            )
+            force_calls += corrector_steps
+            centered_pos_tmp, centered_vel_tmp = remove_com(corr["positions"], corr["velocities"], masses_np)
+            if _is_stable(centered_pos_tmp, centered_vel_tmp, pos_threshold, vel_threshold):
+                success = True
+                correction = corr
+                centered_pos = centered_pos_tmp
+                centered_vel = centered_vel_tmp
+                break
+            scale *= 0.5
+            attempts += 1
+
+        if not success:
+            LOGGER.warning("Macro-step %d diverged; falling back to baseline roll-out", step_idx + 1)
+            corr = apply_corrector(
+                simulation,
+                current_pos_np,
+                current_vel_np,
+                corrector_steps,
+            )
+            force_calls += corrector_steps
+            centered_pos, centered_vel = remove_com(corr["positions"], corr["velocities"], masses_np)
+            correction = corr
+        positions = torch.from_numpy(centered_pos).to(device)
+        velocities = torch.from_numpy(centered_vel).to(device)
+
+        assert centered_pos is not None and centered_vel is not None and correction is not None
+        pos_records.append(centered_pos.astype(np.float32))
+        vel_records.append(centered_vel.astype(np.float32))
         Ekin.append(correction["Ekin"])
         Epot.append(correction["Epot"])
-        force_calls += 1
         LOGGER.info("Step %d/%d complete", step_idx + 1, steps)
 
         # Optionally run an NVE window at configured cadence (measured in base steps)
@@ -241,6 +321,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda", help="Torch device")
     parser.add_argument("--out", type=Path, required=True, help="Output NPZ path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--max-delta-pos", type=float, default=0.2, help="Clamp magnitude of learned Δx (nm)")
+    parser.add_argument("--max-delta-vel", type=float, default=4.5, help="Clamp magnitude of learned Δv (nm/ps)")
+    parser.add_argument("--delta-scale", type=float, default=0.5, help="Scale factor applied to Δx/Δv before integration")
+    parser.add_argument("--max-attempts", type=int, default=3, help="Attempts to shrink the learned update before falling back")
+    parser.add_argument("--pos-threshold", type=float, default=2.0, help="Abort if |x| exceeds this limit (nm)")
+    parser.add_argument("--vel-threshold", type=float, default=8.0, help="Abort if |v| exceeds this limit (nm/ps)")
     return parser
 
 
@@ -256,7 +342,22 @@ def main() -> None:
     md_cfg = MDConfig.from_yaml(args.md_config)
 
     start = time.perf_counter()
-    results = run_hybrid(model, md_cfg, args.molecule, args.initial_md, args.frame, args.steps, args.k_steps, device)
+    results = run_hybrid(
+        model,
+        md_cfg,
+        args.molecule,
+        args.initial_md,
+        args.frame,
+        args.steps,
+        args.k_steps,
+        device,
+        args.max_delta_pos,
+        args.max_delta_vel,
+        args.delta_scale,
+        args.max_attempts,
+        args.pos_threshold,
+        args.vel_threshold,
+    )
     wall_clock = time.perf_counter() - start
 
     baseline_force_calls = args.steps * args.k_steps
