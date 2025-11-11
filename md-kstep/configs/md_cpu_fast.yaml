@@ -1,0 +1,14 @@
+temperature_K: 300.0
+friction_per_ps: 1.0
+dt_fs: 2.0
+length_ns: 1.0
+save_interval_steps: 50
+constraints: HBonds
+implicit_solvent: OBC2
+nonbonded_cutoff_nm: 1.0
+# Short NVE window to keep eval fast while preserving drift metric
+nve_window_ps: 2.0
+nve_every_ps: 20.0
+platform: CPU
+random_seed: 42
+reporter_stride: 10

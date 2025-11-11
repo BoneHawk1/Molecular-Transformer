@@ -1,7 +1,7 @@
 seed: 42
 k_steps: 4
 batch_size: 512
-grad_accum: 4
+grad_accum: 1
 num_workers: 4
 lr: 1.0e-4
 lr_min: 1.0e-5
@@ -24,7 +24,7 @@ resume: null
 wandb:
   enabled: true
   project: md-kstep
-  entity: null
+  entity: dcerrone-dexterity3d
   run_name: null
 random_rotate: true
 random_rotate_mode: batch
