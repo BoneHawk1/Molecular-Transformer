@@ -1,4 +1,4 @@
-arch: egnn
+arch: transformer_egnn
 hidden_dim: 256
 num_layers: 8
 cutoff_nm: 1.0
@@ -11,3 +11,12 @@ force_head_weight: 0.1
 dropout: 0.1
 embedding_dim: 96
 layer_norm: true
+
+# Transformer-specific parameters
+attention_heads: 8
+use_edge_attention: true
+attention_dropout: 0.1
+positional_encoding: learned
+feedforward_dim: 1024  # 4x hidden_dim standard ratio
+attention_type: multi_head  # Options: multi_head, sparse, linear
+use_cross_attention: true  # Cross-layer attention for better information flow
