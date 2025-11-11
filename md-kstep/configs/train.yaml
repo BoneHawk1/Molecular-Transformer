@@ -25,6 +25,7 @@ wandb:
   enabled: true
   project: md-kstep
   entity: dcerrone-dexterity3d
+  entity: dcerrone-dexterity3d
   run_name: null
 random_rotate: true
 random_rotate_mode: batch
