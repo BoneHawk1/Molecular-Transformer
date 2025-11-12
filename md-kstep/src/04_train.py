@@ -284,6 +284,48 @@ def _momentum_loss(pred_vel: torch.Tensor, target_vel: torch.Tensor, masses: tor
     return torch.mean((pred_momentum - target_momentum) ** 2)
 
 
+def _energy_conservation_loss(
+    pred_energy: torch.Tensor,
+    target_energy: torch.Tensor,
+    pred_energy_t: torch.Tensor,
+    target_energy_t: torch.Tensor,
+) -> torch.Tensor:
+    """Loss for energy conservation: ΔE_pred should match ΔE_target."""
+    pred_delta = pred_energy - pred_energy_t
+    target_delta = target_energy - target_energy_t
+    return torch.mean((pred_delta - target_delta) ** 2)
+
+
+def _orbital_orthogonality_loss(orbitals: torch.Tensor) -> torch.Tensor:
+    """
+    Enforce orbital orthogonality constraint.
+    
+    Args:
+        orbitals: [B, M, M] orbital coefficient matrix or [B, M] flattened
+        
+    Returns:
+        Loss measuring deviation from orthogonality
+    """
+    if orbitals.dim() == 2:
+        # Assume flattened, need to reshape
+        # For now, return zero if shape is unclear
+        return torch.tensor(0.0, device=orbitals.device)
+    
+    # Compute overlap matrix S = C^T @ C
+    # For orthonormal orbitals, S should be identity
+    S = torch.bmm(orbitals.transpose(1, 2), orbitals)  # [B, M, M]
+    I = torch.eye(S.shape[-1], device=S.device, dtype=S.dtype).unsqueeze(0)
+    return torch.mean((S - I) ** 2)
+
+
+def _electronic_structure_loss(
+    pred_electronic: torch.Tensor,
+    target_electronic: torch.Tensor,
+) -> torch.Tensor:
+    """Loss for electronic structure prediction."""
+    return torch.mean((pred_electronic - target_electronic) ** 2)
+
+
 def _move_to(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
     for key, val in batch.items():

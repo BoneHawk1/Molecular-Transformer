@@ -1,6 +1,7 @@
 """Equivariant neural network predicting Δx/Δv for k-step MD jumps."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
 
@@ -11,6 +12,8 @@ try:
     from torch_geometric.nn import radius_graph as pyg_radius_graph  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     pyg_radius_graph = None
+
+LOGGER = logging.getLogger("md_kstep.model")
 
 
 @dataclass
@@ -36,6 +39,13 @@ class ModelConfig:
     feedforward_dim: Optional[int] = None  # defaults to 4*hidden_dim if None/0
     attention_type: str = "multi_head"  # placeholder for future variants
     use_cross_attention: bool = False   # reserved flag; not required for single-stream updates
+    # QM-specific options
+    use_qm_features: bool = False  # Enable QM electronic structure features
+    electronic_dim: int = 64  # Dimension for electronic structure encoding
+    num_orbitals: int = 0  # Number of orbitals (0 = auto-detect from input)
+    predict_electronic: bool = False  # Predict electronic structure updates
+    lambda_electronic: float = 0.1  # Weight for electronic structure loss
+    enforce_orthogonality: bool = False  # Enforce orbital orthogonality constraint
 
 
 def _activation(name: str) -> nn.Module:
@@ -398,9 +408,137 @@ class TransformerEGNN(nn.Module):
         return outputs
 
 
+class ElectronicStructureEncoder(nn.Module):
+    """Encoder for electronic structure variables (orbitals, density matrix)."""
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, activation: nn.Module):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            activation,
+            nn.Linear(hidden_dim, hidden_dim),
+            activation,
+            nn.Linear(hidden_dim, output_dim),
+        )
+    
+    def forward(self, electronic_input: torch.Tensor) -> torch.Tensor:
+        """Encode electronic structure input to hidden representation."""
+        return self.encoder(electronic_input)
+
+
+class QMCrossAttention(nn.Module):
+    """Cross-attention between nuclear and electronic features."""
+    def __init__(self, nuclear_dim: int, electronic_dim: int, hidden_dim: int, num_heads: int = 4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        assert hidden_dim % num_heads == 0
+        
+        self.q_proj = nn.Linear(nuclear_dim, hidden_dim)
+        self.k_proj = nn.Linear(electronic_dim, hidden_dim)
+        self.v_proj = nn.Linear(electronic_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, nuclear_dim)
+        
+    def forward(self, nuclear_features: torch.Tensor, electronic_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            nuclear_features: [B, N, nuclear_dim] or [N, nuclear_dim]
+            electronic_features: [B, M, electronic_dim] or [M, electronic_dim] where M is number of orbitals/electronic DOF
+        Returns:
+            Enhanced nuclear features: [B, N, nuclear_dim] or [N, nuclear_dim]
+        """
+        if nuclear_features.dim() == 2:
+            nuclear_features = nuclear_features.unsqueeze(0)
+            electronic_features = electronic_features.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+        
+        B, N, _ = nuclear_features.shape
+        _, M, _ = electronic_features.shape
+        
+        q = self.q_proj(nuclear_features).view(B, N, self.num_heads, self.head_dim)
+        k = self.k_proj(electronic_features).view(B, M, self.num_heads, self.head_dim)
+        v = self.v_proj(electronic_features).view(B, M, self.num_heads, self.head_dim)
+        
+        # Attention: Q @ K^T / sqrt(d)
+        scores = torch.einsum('bnhd,bmhd->bnmh', q, k) / (self.head_dim ** 0.5)
+        attn = torch.softmax(scores, dim=2)
+        
+        # Apply attention to values
+        out = torch.einsum('bnmh,bmhd->bnhd', attn, v)
+        out = out.contiguous().view(B, N, -1)
+        out = self.out_proj(out)
+        
+        if squeeze_output:
+            out = out.squeeze(0)
+        
+        return out
+
+
+class QMEnhancedModel(nn.Module):
+    """EGNN model enhanced with QM electronic structure features."""
+    def __init__(self, cfg: ModelConfig, num_atom_types: int = 100, num_orbitals: int = 0):
+        super().__init__()
+        self.cfg = cfg
+        self.base_model = EquivariantKStepModel(cfg, num_atom_types)
+        
+        if cfg.use_qm_features:
+            self.electronic_encoder = ElectronicStructureEncoder(
+                input_dim=num_orbitals if num_orbitals > 0 else 64,
+                hidden_dim=cfg.electronic_dim,
+                output_dim=cfg.electronic_dim,
+                activation=_activation(cfg.activation),
+            )
+            self.qm_attention = QMCrossAttention(
+                nuclear_dim=cfg.hidden_dim,
+                electronic_dim=cfg.electronic_dim,
+                hidden_dim=cfg.hidden_dim,
+                num_heads=cfg.attention_heads // 2,
+            )
+            
+            if cfg.predict_electronic:
+                self.head_electronic = nn.Linear(cfg.hidden_dim, num_orbitals if num_orbitals > 0 else 64)
+        else:
+            self.electronic_encoder = None
+            self.qm_attention = None
+            self.head_electronic = None
+    
+    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Forward pass with optional QM features."""
+        outputs = self.base_model(batch)
+        
+        if self.cfg.use_qm_features and "electronic_t" in batch:
+            # Encode electronic structure
+            electronic_encoded = self.electronic_encoder(batch["electronic_t"])
+            
+            # Apply cross-attention
+            nuclear_features = self.base_model.node_proj(
+                torch.cat([
+                    self.base_model.atom_emb(batch["atom_types"]),
+                    self.base_model.vel_proj(batch["v_t"]),
+                    self.base_model.mass_proj(batch["masses"].unsqueeze(-1)),
+                ], dim=-1)
+            )
+            enhanced_nuclear = self.qm_attention(nuclear_features, electronic_encoded)
+            
+            # Predict electronic updates if requested
+            if self.cfg.predict_electronic and self.head_electronic is not None:
+                outputs["delta_electronic"] = self.head_electronic(enhanced_nuclear.mean(dim=1))
+        
+        return outputs
+
+
 def build_model_from_config(cfg_dict: Dict) -> nn.Module:
     cfg = ModelConfig(**cfg_dict)
     arch = (cfg.arch or "egnn").lower()
+    num_orbitals = cfg_dict.get("num_orbitals", 0)
+    
+    if cfg.use_qm_features:
+        if arch in ("egnn", "basic_egnn"):
+            return QMEnhancedModel(cfg, num_atom_types=100, num_orbitals=num_orbitals)
+        # For transformer, we'd need a QM-enhanced version too
+        LOGGER.warning("QM features not yet implemented for transformer_egnn, using base model")
+    
     if arch in ("egnn", "basic_egnn"):
         return EquivariantKStepModel(cfg)
     if arch in ("transformer_egnn", "attention_egnn", "egnn_transformer"):
