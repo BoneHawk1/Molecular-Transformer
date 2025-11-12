@@ -638,6 +638,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--train-config", type=Path, required=True, help="Training YAML config")
     parser.add_argument("--splits", type=Path, nargs=2, required=True, help="Train and val split JSON files")
     parser.add_argument("--device", default="cuda", help="Torch device (default: cuda)")
+    parser.add_argument("--pretrained", type=Path, default=None, help="Pretrained checkpoint for transfer learning (optional)")
+    parser.add_argument("--freeze-layers", type=int, default=0, help="Number of initial layers to freeze (transfer learning)")
     return parser
 
 
@@ -694,6 +696,37 @@ def main() -> None:
 
     model = build_model_from_config(model_cfg)
     model.to(device)
+    
+    # Transfer learning: Load pretrained weights if provided
+    if args.pretrained:
+        LOGGER.info("Loading pretrained weights from %s", args.pretrained)
+        try:
+            checkpoint = torch.load(args.pretrained, map_location=device)
+            if "model" in checkpoint:
+                state_dict = checkpoint["model"]
+            else:
+                state_dict = checkpoint
+            
+            # Try to load with strict=False to handle potential architecture mismatches
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            
+            if missing_keys:
+                LOGGER.warning("Missing keys in pretrained checkpoint: %s", missing_keys)
+            if unexpected_keys:
+                LOGGER.warning("Unexpected keys in pretrained checkpoint: %s", unexpected_keys)
+            
+            LOGGER.info("Successfully loaded pretrained weights")
+            
+            # Optionally freeze early layers for transfer learning
+            if args.freeze_layers > 0:
+                LOGGER.info("Freezing first %d layers", args.freeze_layers)
+                for idx, layer in enumerate(model.layers[:args.freeze_layers]):
+                    for param in layer.parameters():
+                        param.requires_grad = False
+                LOGGER.info("Frozen layers will not be updated during training")
+        except Exception as e:
+            LOGGER.error("Failed to load pretrained checkpoint: %s", e)
+            raise
 
     train_loader = DataLoader(
         train_dataset,

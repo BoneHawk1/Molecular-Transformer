@@ -1,0 +1,14 @@
+# QM trajectory configuration for xTB
+temperature_K: 300.0
+friction_per_ps: 0.002  # Lower friction for QM (more realistic dynamics)
+dt_fs: 0.25  # QM-appropriate timestep (much smaller than MM's 2 fs)
+length_ps: 30.0  # Shorter than MM (QM is expensive) - aim for 30-50 ps
+save_interval_steps: 1  # Save every step for dense supervision
+method: GFN2-xTB  # xTB method (GFN2-xTB is most accurate)
+random_seed: 42
+charge: 0  # Neutral molecules only for PoC
+spin_multiplicity: 1  # Singlets only for PoC
+equilibration_ps: 5.0  # Short equilibration before production
+nve_window_ps: 10.0  # NVE windows for energy conservation analysis
+nve_every_ps: 20.0  # Run NVE window every 20 ps
+
