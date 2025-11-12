@@ -1,0 +1,188 @@
+{
+  "molecules": [
+    {
+      "molecule": "C1=CC(=O)NC(=O)N1",
+      "nve_drift_baseline": {
+        "median": -0.005620574951171875,
+        "iqr": 0.03189583778381347
+      },
+      "nve_drift_hybrid": {
+        "median": 0.006084232330322265,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.033490441739559174,
+      "angle_diff_rmse": 3.4723060131073,
+      "dihedral_diff_rmse": 0.4737836420536041,
+      "rdf_l1": 0.028828198090195656
+    },
+    {
+      "molecule": "CC(=O)Oc1ccccc1C(=O)O",
+      "nve_drift_baseline": {
+        "median": -0.005086021423339844,
+        "iqr": 0.010290660858154296
+      },
+      "nve_drift_hybrid": {
+        "median": 0.009009475708007813,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.03475767746567726,
+      "angle_diff_rmse": 3.627467155456543,
+      "dihedral_diff_rmse": 7.694709300994873,
+      "rdf_l1": 0.030961956828832626
+    },
+    {
+      "molecule": "CC(C)C(=O)O",
+      "nve_drift_baseline": {
+        "median": -0.0032470130920410154,
+        "iqr": 0.0335819149017334
+      },
+      "nve_drift_hybrid": {
+        "median": 0.0006505012512207031,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.03919706493616104,
+      "angle_diff_rmse": 4.768168926239014,
+      "dihedral_diff_rmse": 25.383602142333984,
+      "rdf_l1": 0.03965141624212265
+    },
+    {
+      "molecule": "CC(C)CO",
+      "nve_drift_baseline": {
+        "median": -0.004518146514892578,
+        "iqr": 0.008024444580078125
+      },
+      "nve_drift_hybrid": {
+        "median": 0.005421085357666016,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.038325849920511246,
+      "angle_diff_rmse": 4.042764663696289,
+      "dihedral_diff_rmse": 9.825663566589355,
+      "rdf_l1": 0.03692810237407684
+    },
+    {
+      "molecule": "CC(C)NCCO",
+      "nve_drift_baseline": {
+        "median": 0.004722747802734373,
+        "iqr": 0.06307180404663086
+      },
+      "nve_drift_hybrid": {
+        "median": -0.006013412475585938,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.03574991598725319,
+      "angle_diff_rmse": 3.9086966514587402,
+      "dihedral_diff_rmse": 23.333459854125977,
+      "rdf_l1": 0.04575163125991821
+    },
+    {
+      "molecule": "CC1=CC(=O)NC(=O)N1",
+      "nve_drift_baseline": {
+        "median": -0.0026277923583984376,
+        "iqr": 0.018712377548217776
+      },
+      "nve_drift_hybrid": {
+        "median": -0.015876617431640625,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.03644479811191559,
+      "angle_diff_rmse": 3.5728085041046143,
+      "dihedral_diff_rmse": 0.7986488938331604,
+      "rdf_l1": 0.029865648597478867
+    },
+    {
+      "molecule": "CCN(CC)CCO",
+      "nve_drift_baseline": {
+        "median": 0.011813125610351562,
+        "iqr": 0.05143762588500977
+      },
+      "nve_drift_hybrid": {
+        "median": 0.013598442077636719,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.038561705499887466,
+      "angle_diff_rmse": 4.638045787811279,
+      "dihedral_diff_rmse": 17.990657806396484,
+      "rdf_l1": 0.04446779191493988
+    },
+    {
+      "molecule": "CCOC(=O)N",
+      "nve_drift_baseline": {
+        "median": -0.00798969268798828,
+        "iqr": 0.012309155464172362
+      },
+      "nve_drift_hybrid": {
+        "median": -0.010653533935546876,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.03178102895617485,
+      "angle_diff_rmse": 4.219950199127197,
+      "dihedral_diff_rmse": 1.1737463474273682,
+      "rdf_l1": 0.02832244150340557
+    },
+    {
+      "molecule": "c1ccc(cc1)C(=O)N",
+      "nve_drift_baseline": {
+        "median": 0.009738812446594237,
+        "iqr": 0.021358094215393066
+      },
+      "nve_drift_hybrid": {
+        "median": 0.00918832778930664,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.03705652803182602,
+      "angle_diff_rmse": 3.46791934967041,
+      "dihedral_diff_rmse": 1.074732780456543,
+      "rdf_l1": 0.030047204345464706
+    },
+    {
+      "molecule": "c1ccc2c(c1)OCO2",
+      "nve_drift_baseline": {
+        "median": -0.006610527038574219,
+        "iqr": 0.02222773790359497
+      },
+      "nve_drift_hybrid": {
+        "median": -0.0009976005554199218,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.0338873527944088,
+      "angle_diff_rmse": 3.420225143432617,
+      "dihedral_diff_rmse": 5.567112445831299,
+      "rdf_l1": 0.029230212792754173
+    },
+    {
+      "molecule": "c1ccccc1O",
+      "nve_drift_baseline": {
+        "median": 0.007652139663696289,
+        "iqr": 0.015554013252258303
+      },
+      "nve_drift_hybrid": {
+        "median": 0.018002700805664063,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.03309432417154312,
+      "angle_diff_rmse": 3.6283211708068848,
+      "dihedral_diff_rmse": 0.9736743569374084,
+      "rdf_l1": 0.02847806178033352
+    },
+    {
+      "molecule": "c1ccncc1",
+      "nve_drift_baseline": {
+        "median": -0.006115012168884278,
+        "iqr": 0.005321103334426879
+      },
+      "nve_drift_hybrid": {
+        "median": 0.003516044616699219,
+        "iqr": 0.0
+      },
+      "bond_diff_rmse": 0.03524274006485939,
+      "angle_diff_rmse": 3.094233512878418,
+      "dihedral_diff_rmse": 0.2518634498119354,
+      "rdf_l1": 0.03289760276675224
+    }
+  ],
+  "mean_bond_rmse": 0.0356324523066481,
+  "mean_angle_rmse": 3.8217422564824424,
+  "mean_dihedral_rmse": 7.878471215565999,
+  "mean_rdf_l1": 0.033785855708022915
+}

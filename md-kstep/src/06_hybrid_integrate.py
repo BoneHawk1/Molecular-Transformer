@@ -215,7 +215,8 @@ def run_hybrid(model: torch.nn.Module, md_cfg: MDConfig, molecule_dir: Path, md_
     LOGGER.info("Corrector cadence: %d micro-steps per macro-step (baseline %d)", corrector_steps, baseline_steps)
 
     for step_idx in range(steps):
-        with torch.no_grad():
+        use_amp = bool(getattr(run_hybrid, "_use_amp", False)) and (device.type == "cuda")
+        with torch.inference_mode():
             batch = {
                 "x_t": positions,
                 "v_t": velocities,
@@ -223,9 +224,14 @@ def run_hybrid(model: torch.nn.Module, md_cfg: MDConfig, molecule_dir: Path, md_
                 "masses": masses,
                 "batch": batch_index,
             }
-            outputs = model(batch)
-            delta_pos = outputs["delta_pos"]
-            delta_vel = outputs["delta_vel"]
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    outputs = model(batch)
+            else:
+                outputs = model(batch)
+            # Convert to fp32 for numerical stability and CPU interop
+            delta_pos = outputs["delta_pos"].to(torch.float32)
+            delta_vel = outputs["delta_vel"].to(torch.float32)
             delta_pos = _limit_vector_norm(delta_pos, max_delta_pos)
             delta_vel = _limit_vector_norm(delta_vel, max_delta_vel)
 
@@ -337,6 +343,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-attempts", type=int, default=3, help="Attempts to shrink the learned update before falling back")
     parser.add_argument("--pos-threshold", type=float, default=2.0, help="Abort if |x| exceeds this limit (nm)")
     parser.add_argument("--vel-threshold", type=float, default=8.0, help="Abort if |v| exceeds this limit (nm/ps)")
+    parser.add_argument("--amp", action="store_true", help="Enable mixed-precision (fp16) inference on CUDA")
+    parser.add_argument("--compile", action="store_true", help="Compile the model for inference (PyTorch 2.x)")
     # Corrector cadence controls
     parser.add_argument("--corrector-steps", type=int, default=0, help="If >0, number of OpenMM micro-steps per macro-step (accelerates when < baseline)")
     parser.add_argument("--corrector-fraction", type=float, default=0.05, help="Fraction of baseline steps to spend in corrector if --corrector-steps == 0")
@@ -350,8 +358,18 @@ def main() -> None:
     set_seed(args.seed)
 
     device = torch.device(args.device)
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
     model_cfg = load_yaml(args.model_config)
     model = load_model(args.checkpoint, model_cfg, device)
+    if args.compile:
+        try:
+            model = torch.compile(model, mode="max-autotune")  # type: ignore[attr-defined]
+            LOGGER.info("Model compiled for inference")
+        except Exception as e:
+            LOGGER.warning("torch.compile unavailable or failed: %s", e)
     md_cfg = MDConfig.from_yaml(args.md_config)
 
     # Communicate corrector cadence choice to run_hybrid via function attributes (avoids changing signature)
@@ -363,6 +381,9 @@ def main() -> None:
         run_hybrid._corrector_fraction = float(args.corrector_fraction)  # type: ignore[attr-defined]
 
     start = time.perf_counter()
+    # Configure runtime options passed via function attributes
+    run_hybrid._use_amp = bool(args.amp)  # type: ignore[attr-defined]
+
     results = run_hybrid(
         model,
         md_cfg,
@@ -392,6 +413,8 @@ def main() -> None:
         "force_calls_hybrid": results["force_calls"],
         "force_calls_baseline": baseline_force_calls,
         "force_call_savings": savings,
+        "amp": bool(args.amp),
+        "compiled": bool(args.compile),
         "corrector_steps": int(getattr(run_hybrid, "_corrector_override", 0) or max(1, int(args.k_steps * md_cfg.save_interval_steps * float(getattr(run_hybrid, "_corrector_fraction", 0.05))))),
         "corrector_fraction": float(getattr(run_hybrid, "_corrector_fraction", 0.05)),
         "initial_metadata": results["metadata"],
