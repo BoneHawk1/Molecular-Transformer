@@ -1,0 +1,11 @@
+arch: torchmdnet_et
+hidden_channels: 128
+num_layers: 4
+num_heads: 4
+cutoff_nm: 0.7
+rbf_size: 16
+vec_channels: 16
+predict_delta: true
+max_disp_nm: 0.02
+use_force_head: false
+tanh_head: true

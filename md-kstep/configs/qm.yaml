@@ -1,0 +1,22 @@
+# QM calculation configuration
+method: HF  # HF, DFT, MP2, etc.
+basis: sto-3g  # Basis set name
+functional: B3LYP  # For DFT
+charge: 0
+spin: 0  # 2S+1
+scf_max_cycles: 100
+scf_conv_tol: 1.0e-6
+scf_level_shift: 0.0
+scf_diis_space: 8
+scf_diis_start_cycle: 1
+scf_damp_factor: 0.0
+scf_mix_alpha: 0.5
+scf_verbose: 0
+# QM/MM options
+qm_atom_indices: null  # List of QM atom indices for QM/MM
+mm_charges: null  # MM point charges
+mm_positions: null  # MM positions in nm
+# Caching
+cache_dir: null  # Path to cache directory (null = no cache)
+use_cache: true
+

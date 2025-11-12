@@ -1,0 +1,29 @@
+# QM-enhanced model configuration
+arch: egnn  # egnn, transformer_egnn
+hidden_dim: 128
+num_layers: 4
+cutoff_nm: 0.7
+activation: silu
+predict_delta: true
+max_disp_nm: 0.02
+max_dvel_nm_per_ps: 0.1
+use_force_head: false
+force_head_weight: 0.1
+dropout: 0.0
+embedding_dim: 64
+layer_norm: true
+attention_heads: 8
+use_edge_attention: true
+attention_dropout: 0.0
+positional_encoding: none
+feedforward_dim: null
+attention_type: multi_head
+use_cross_attention: false
+# QM-specific options
+use_qm_features: false  # Enable QM electronic structure features
+electronic_dim: 64  # Dimension for electronic structure encoding
+num_orbitals: 0  # Number of orbitals (0 = auto-detect)
+predict_electronic: false  # Predict electronic structure updates
+lambda_electronic: 0.1  # Weight for electronic structure loss
+enforce_orthogonality: false  # Enforce orbital orthogonality constraint
+

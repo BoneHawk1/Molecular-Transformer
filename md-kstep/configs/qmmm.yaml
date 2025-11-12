@@ -1,0 +1,9 @@
+# QM/MM boundary configuration
+qm_atom_indices: []  # List of atom indices in QM region
+mm_charges: []  # MM point charges in elementary charge units
+mm_positions: []  # MM positions in nm [M, 3]
+boundary_type: electrostatic  # electrostatic, mechanical, link_atom
+link_atom_element: H  # Element for link atoms
+cutoff_qmmm: 1.2  # QM/MM interaction cutoff in nm
+embedding: electrostatic  # electrostatic, mechanical, polarizable
+
