@@ -20,7 +20,8 @@ mkdir -p "$OUT_DIR"
 python src/01b_run_qm_baselines.py \
     --smiles-file "$SMILES_FILE" \
     --config "$CONFIG" \
-    --out "$OUT_DIR"
+    --out "$OUT_DIR" \
+    --num-workers 20 \
 
 echo ""
 echo "QM trajectory generation complete!"

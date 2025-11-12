@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -11,7 +13,7 @@ import numpy as np
 
 try:
     from ase import Atoms, units
-    from ase.calculators.xtb import XTB
+    from xtb.ase.calculator import XTB
     from ase.md.langevin import Langevin
     from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
     from rdkit import Chem
@@ -308,6 +310,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, required=True, help="QM configuration YAML")
     parser.add_argument("--out", type=Path, required=True, help="Output directory for trajectories")
     parser.add_argument("--molecule", type=str, default=None, help="Run specific molecule only (by name)")
+    parser.add_argument("--num-workers", type=int, default=1, help="Number of parallel worker processes")
+    parser.add_argument("--omp-num-threads", type=int, default=None, help="Set OMP_NUM_THREADS for xTB per process")
     return parser
 
 
@@ -316,6 +320,24 @@ def main() -> None:
     configure_logging()
     config = QMConfig.from_dict(load_yaml(args.config))
     set_seed(config.random_seed)
+
+    # Configure OpenMP threading for xTB if requested.
+    if args.omp_num_threads is not None:
+        try:
+            threads = int(args.omp_num_threads)
+            if threads > 0:
+                os.environ["OMP_NUM_THREADS"] = str(threads)
+                os.environ.setdefault("OMP_STACKSIZE", "4G")
+            else:
+                LOGGER.warning("Ignoring non-positive --omp-num-threads=%d", threads)
+        except (TypeError, ValueError):
+            LOGGER.warning("Invalid --omp-num-threads=%r; leaving OMP_NUM_THREADS unchanged", args.omp_num_threads)
+    elif int(args.num_workers) > 1:
+        # Default to 1 thread per worker to avoid oversubscription when parallelizing.
+        if os.environ.get("OMP_NUM_THREADS") is None:
+            os.environ["OMP_NUM_THREADS"] = "1"
+            os.environ.setdefault("OMP_STACKSIZE", "4G")
+            LOGGER.info("Setting default OMP_NUM_THREADS=1 for parallel workers (override with --omp-num-threads)")
     
     # Parse SMILES file
     molecules = []
@@ -338,13 +360,31 @@ def main() -> None:
             LOGGER.error("Molecule %s not found in SMILES file", args.molecule)
             return
     
-    # Run trajectories
-    for smiles, name in molecules:
-        try:
-            run_qm(smiles, name, args.out, config)
-        except Exception as e:
-            LOGGER.error("Failed to run QM for %s: %s", name, e)
-            continue
+    # Run trajectories (parallel if requested)
+    num_workers = max(1, int(args.num_workers))
+    if num_workers > 1 and len(molecules) > 1:
+        LOGGER.info("Running %d molecules with %d workers (OMP_NUM_THREADS=%s)", len(molecules), num_workers, os.environ.get("OMP_NUM_THREADS", "default"))
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            future_to_name = {
+                executor.submit(run_qm, smiles, name, args.out, config): name
+                for smiles, name in molecules
+            }
+            for future in as_completed(future_to_name):
+                name = future_to_name[future]
+                try:
+                    npz_path = future.result()
+                    LOGGER.info("Completed %s -> %s", name, npz_path)
+                except Exception as e:
+                    LOGGER.error("Failed to run QM for %s: %s", name, e)
+                    continue
+    else:
+        LOGGER.info("Running sequentially (num-workers=%d)", num_workers)
+        for smiles, name in molecules:
+            try:
+                run_qm(smiles, name, args.out, config)
+            except Exception as e:
+                LOGGER.error("Failed to run QM for %s: %s", name, e)
+                continue
 
 
 if __name__ == "__main__":

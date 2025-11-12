@@ -12,7 +12,7 @@ conda activate kstep
 conda install -c conda-forge xtb ase
 
 # Verify installation
-python -c "from ase.calculators.xtb import XTB; print('xTB OK')"
+python -c "from xtb.ase.calculators import XTB; print('xTB OK')"
 ```
 
 ## Step 1: Generate QM Training Trajectories

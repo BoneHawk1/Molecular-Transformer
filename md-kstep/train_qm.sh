@@ -10,7 +10,7 @@ MODEL_CONFIG="configs/model_qm.yaml"
 TRAIN_CONFIG="configs/train_qm.yaml"
 TRAIN_SPLIT="data/qm_splits/train.json"
 VAL_SPLIT="data/qm_splits/val.json"
-PRETRAINED="outputs/checkpoints_transformer/best.pt"  # MM pretrained model
+PRETRAINED="outputs/checkpoints_transformer_aug_wide/best.pt"  # MM pretrained model
 
 echo "Training QM k-step model with transfer learning"
 echo "Dataset: $QM_DATASET"
