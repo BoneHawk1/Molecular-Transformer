@@ -7,6 +7,7 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -152,6 +153,16 @@ def _run_nve_window_ase(atoms: Atoms, config: QMConfig, steps: int) -> Dict[str,
         "potential": energies[:, 1],
         "total": energies.sum(axis=1),
     }
+
+
+def _worker_init(threads_per_worker: int) -> None:
+    """Initialize worker process with proper threading limits."""
+    if threads_per_worker > 0:
+        os.environ["OMP_NUM_THREADS"] = str(threads_per_worker)
+        os.environ["MKL_NUM_THREADS"] = str(threads_per_worker)
+        os.environ["OPENBLAS_NUM_THREADS"] = str(threads_per_worker)
+        os.environ["NUMEXPR_NUM_THREADS"] = str(threads_per_worker)
+        os.environ.setdefault("OMP_STACKSIZE", "4G")
 
 
 def run_qm(smiles: str, name: str, out_dir: Path, config: QMConfig) -> Path:
@@ -344,24 +355,18 @@ def main() -> None:
     config = QMConfig.from_dict(load_yaml(args.config))
     set_seed(config.random_seed)
 
-    # Configure OpenMP threading for xTB if requested.
+    # Determine threads per worker
+    threads_per_worker = 1  # Default for parallel execution
     if args.omp_num_threads is not None:
         try:
-            threads = int(args.omp_num_threads)
-            if threads > 0:
-                os.environ["OMP_NUM_THREADS"] = str(threads)
-                os.environ.setdefault("OMP_STACKSIZE", "4G")
-            else:
-                LOGGER.warning("Ignoring non-positive --omp-num-threads=%d", threads)
+            threads_per_worker = int(args.omp_num_threads)
+            if threads_per_worker <= 0:
+                LOGGER.warning("Ignoring non-positive --omp-num-threads=%d, using 1", threads_per_worker)
+                threads_per_worker = 1
         except (TypeError, ValueError):
-            LOGGER.warning("Invalid --omp-num-threads=%r; leaving OMP_NUM_THREADS unchanged", args.omp_num_threads)
-    elif int(args.num_workers) > 1:
-        # Default to 1 thread per worker to avoid oversubscription when parallelizing.
-        if os.environ.get("OMP_NUM_THREADS") is None:
-            os.environ["OMP_NUM_THREADS"] = "1"
-            os.environ.setdefault("OMP_STACKSIZE", "4G")
-            LOGGER.info("Setting default OMP_NUM_THREADS=1 for parallel workers (override with --omp-num-threads)")
-    
+            LOGGER.warning("Invalid --omp-num-threads=%r, using 1", args.omp_num_threads)
+            threads_per_worker = 1
+
     # Parse SMILES file
     molecules = []
     with open(args.smiles_file, 'r') as f:
@@ -386,8 +391,10 @@ def main() -> None:
     # Run trajectories (parallel if requested)
     num_workers = max(1, int(args.num_workers))
     if num_workers > 1 and len(molecules) > 1:
-        LOGGER.info("Running %d molecules with %d workers (OMP_NUM_THREADS=%s)", len(molecules), num_workers, os.environ.get("OMP_NUM_THREADS", "default"))
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        LOGGER.info("Running %d molecules with %d workers (%d threads per worker)", len(molecules), num_workers, threads_per_worker)
+        # Use initializer to set thread limits in each worker process BEFORE any libraries load
+        initializer = partial(_worker_init, threads_per_worker)
+        with ProcessPoolExecutor(max_workers=num_workers, initializer=initializer) as executor:
             future_to_name = {
                 executor.submit(run_qm, smiles, name, args.out, config): name
                 for smiles, name in molecules
@@ -401,7 +408,9 @@ def main() -> None:
                     LOGGER.error("Failed to run QM for %s: %s", name, e)
                     continue
     else:
-        LOGGER.info("Running sequentially (num-workers=%d)", num_workers)
+        LOGGER.info("Running sequentially (num-workers=%d, threads=%d)", num_workers, threads_per_worker)
+        # Set environment variables for sequential execution
+        _worker_init(threads_per_worker)
         for smiles, name in molecules:
             try:
                 run_qm(smiles, name, args.out, config)
