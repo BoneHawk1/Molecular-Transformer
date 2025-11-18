@@ -13,16 +13,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-try:
-    from ase import Atoms, units
-    from xtb.ase.calculator import XTB
-    from ase.md.langevin import Langevin
-    from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
-    from rdkit import Chem
-    from rdkit.Chem import AllChem
-except ImportError as e:
-    raise ImportError("QM baseline requires: pip install ase rdkit-pypi; conda install -c conda-forge xtb") from e
-
+# Import only non-threaded libraries at module level
+# ASE/xTB imports MUST be deferred to run_qm() so worker_init sets OMP_NUM_THREADS first
 from utils import configure_logging, ensure_dir, load_yaml, set_seed, compute_time_grid, LOGGER
 
 
@@ -59,8 +51,12 @@ class QMConfig:
         )
 
 
-def _smiles_to_atoms(smiles: str, charge: int = 0) -> Atoms:
+def _smiles_to_atoms(smiles: str, charge: int = 0):
     """Convert SMILES to ASE Atoms with 3D coordinates."""
+    from ase import Atoms
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f"Invalid SMILES: {smiles}")
@@ -88,12 +84,12 @@ def _smiles_to_atoms(smiles: str, charge: int = 0) -> Atoms:
     return atoms
 
 
-def _get_masses_ase(atoms: Atoms) -> np.ndarray:
+def _get_masses_ase(atoms) -> np.ndarray:
     """Get atomic masses in Daltons."""
     return atoms.get_masses()
 
 
-def _collect_frame_ase(atoms: Atoms) -> Dict[str, np.ndarray]:
+def _collect_frame_ase(atoms) -> Dict[str, np.ndarray]:
     """Collect state from ASE Atoms object."""
     positions = atoms.get_positions() / 10.0  # Angstrom -> nm
     velocities = atoms.get_velocities() * 100.0  # Angstrom/fs -> nm/ps
@@ -120,10 +116,12 @@ def _collect_frame_ase(atoms: Atoms) -> Dict[str, np.ndarray]:
     }
 
 
-def _run_nve_window_ase(atoms: Atoms, config: QMConfig, steps: int) -> Dict[str, np.ndarray]:
+def _run_nve_window_ase(atoms, config: QMConfig, steps: int) -> Dict[str, np.ndarray]:
     """Run NVE (microcanonical) window for energy conservation analysis."""
+    from ase import units
     from ase.md.verlet import VelocityVerlet
-    
+    from xtb.ase.calculator import XTB
+
     # Create fresh calculator for NVE
     atoms.calc = XTB(method=config.method, charge=config.charge)
     
@@ -156,19 +154,31 @@ def _run_nve_window_ase(atoms: Atoms, config: QMConfig, steps: int) -> Dict[str,
 
 
 def _worker_init(threads_per_worker: int) -> None:
-    """Initialize worker process with proper threading limits."""
+    """Initialize worker process with proper threading limits.
+
+    CRITICAL: This must run BEFORE any numerical libraries (xTB, numpy, scipy, etc.)
+    are imported, otherwise they will initialize their own threading pools.
+    """
     if threads_per_worker > 0:
         os.environ["OMP_NUM_THREADS"] = str(threads_per_worker)
         os.environ["MKL_NUM_THREADS"] = str(threads_per_worker)
         os.environ["OPENBLAS_NUM_THREADS"] = str(threads_per_worker)
         os.environ["NUMEXPR_NUM_THREADS"] = str(threads_per_worker)
         os.environ.setdefault("OMP_STACKSIZE", "4G")
+        # Debug: confirm initialization (use print, logging may not be set up yet)
+        print(f"[DEBUG Worker {os.getpid()}] Thread limits set: OMP={threads_per_worker}", flush=True)
 
 
 def run_qm(smiles: str, name: str, out_dir: Path, config: QMConfig) -> Path:
     """Run QM trajectory for a single molecule."""
+    # Import ASE/xTB INSIDE function so worker_init runs first
+    from ase import units
+    from ase.md.langevin import Langevin
+    from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
+    from xtb.ase.calculator import XTB
+
     LOGGER.info("Setting up QM trajectory for %s (SMILES: %s)", name, smiles)
-    
+
     # Build initial structure
     atoms = _smiles_to_atoms(smiles, config.charge)
     n_atoms = len(atoms)
