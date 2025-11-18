@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -193,17 +194,17 @@ def run_qm(smiles: str, name: str, out_dir: Path, config: QMConfig) -> Path:
     total_steps = int(config.length_ps * 1000 / config.dt_fs)
     save_interval = config.save_interval_steps
     num_frames = total_steps // save_interval + 1
-    
+
     LOGGER.info("Running %d steps (%.1f ps) with save interval %d", total_steps, config.length_ps, save_interval)
-    
+
     # Allocate storage
     positions = np.zeros((num_frames, n_atoms, 3), dtype=np.float32)
     velocities = np.zeros_like(positions)
     forces = np.zeros_like(positions)
     kinetic = np.zeros(num_frames, dtype=np.float64)
     potential = np.zeros_like(kinetic)
-    total = np.zeros_like(kinetic)
-    
+    total_energy = np.zeros_like(kinetic)
+
     # Setup dynamics
     dyn = Langevin(
         atoms,
@@ -211,61 +212,83 @@ def run_qm(smiles: str, name: str, out_dir: Path, config: QMConfig) -> Path:
         temperature_K=config.temperature_K,
         friction=config.friction_per_ps / (1000.0 / units.fs),
     )
-    
-    save_idx = 0
+
+    # Observer closure to collect data efficiently during MD run
+    save_idx = [0]  # Use list to allow mutation in closure
     nve_payload: List[Dict[str, np.ndarray]] = []
     nve_window_steps = int((config.nve_window_ps * 1000) / config.dt_fs) if config.nve_window_ps > 0 else 0
     nve_every_steps = int((config.nve_every_ps * 1000) / config.dt_fs) if config.nve_every_ps > 0 else 0
-    
-    for step in range(0, total_steps + 1):
+    failed = [False]  # Track if simulation failed
+    start_time = [time.time()]  # Track start time for ETA calculation
+
+    def observer():
+        """Called by ASE dynamics at each timestep."""
+        step = dyn.nsteps
+
+        # Save data at specified interval
         if step % save_interval == 0:
-            frame = _collect_frame_ase(atoms)
-            positions[save_idx] = frame["positions"]
-            velocities[save_idx] = frame["velocities"]
-            forces[save_idx] = frame["forces"]
-            kinetic[save_idx] = frame["kinetic"]
-            potential[save_idx] = frame["potential"]
-            total[save_idx] = frame["total"]
-            
-            # Optional NVE windows
-            if nve_window_steps > 0 and nve_every_steps > 0 and step % nve_every_steps == 0:
-                LOGGER.info("Running NVE window (%d steps) from step %d", nve_window_steps, step)
-                # Save current state
-                pos_save = atoms.get_positions().copy()
-                vel_save = atoms.get_velocities().copy()
-                
-                nve_payload.append(_run_nve_window_ase(atoms, config, nve_window_steps))
-                
-                # Restore state and reinitialize Langevin
-                atoms.set_positions(pos_save)
-                atoms.set_velocities(vel_save)
-                atoms.calc = XTB(method=config.method, charge=config.charge)
-                dyn = Langevin(
-                    atoms,
-                    timestep=config.dt_fs * units.fs,
-                    temperature_K=config.temperature_K,
-                    friction=config.friction_per_ps / (1000.0 / units.fs),
-                )
-            
-            save_idx += 1
-            
-            # Progress logging
-            if step % (total_steps // 10) == 0:
-                LOGGER.info("Progress: %d/%d steps (%.1f%%)", step, total_steps, 100 * step / total_steps)
-        
-        if step < total_steps:
             try:
-                dyn.run(1)
+                frame = _collect_frame_ase(atoms)
+                idx = save_idx[0]
+                if idx < num_frames:
+                    positions[idx] = frame["positions"]
+                    velocities[idx] = frame["velocities"]
+                    forces[idx] = frame["forces"]
+                    kinetic[idx] = frame["kinetic"]
+                    potential[idx] = frame["potential"]
+                    total_energy[idx] = frame["total"]
+                    save_idx[0] += 1
+
+                # Optional NVE windows
+                if nve_window_steps > 0 and nve_every_steps > 0 and step % nve_every_steps == 0 and step > 0:
+                    LOGGER.info("Running NVE window (%d steps) from step %d", nve_window_steps, step)
+                    # Save current state
+                    pos_save = atoms.get_positions().copy()
+                    vel_save = atoms.get_velocities().copy()
+
+                    nve_payload.append(_run_nve_window_ase(atoms, config, nve_window_steps))
+
+                    # Restore state and reinitialize Langevin
+                    atoms.set_positions(pos_save)
+                    atoms.set_velocities(vel_save)
+                    atoms.calc = XTB(method=config.method, charge=config.charge)
+                    # Note: Cannot recreate dyn object here, but state is restored
+
+                # Progress logging with ETA
+                if step > 0 and step % (total_steps // 10) == 0:
+                    elapsed_sec = time.time() - start_time[0]
+                    progress_frac = step / total_steps
+                    estimated_total_sec = elapsed_sec / progress_frac
+                    eta_sec = estimated_total_sec - elapsed_sec
+
+                    elapsed_min = elapsed_sec / 60
+                    eta_min = eta_sec / 60
+
+                    LOGGER.info("Progress: %d/%d steps (%.1f%%) | Elapsed: %.1f min | ETA: %.1f min",
+                               step, total_steps, 100 * progress_frac, elapsed_min, eta_min)
+
             except Exception as e:
-                LOGGER.error("QM step failed at step %d: %s", step, e)
-                # Truncate arrays to saved frames
-                positions = positions[:save_idx]
-                velocities = velocities[:save_idx]
-                forces = forces[:save_idx]
-                kinetic = kinetic[:save_idx]
-                potential = potential[:save_idx]
-                total = total[:save_idx]
-                break
+                LOGGER.error("QM observer failed at step %d: %s", step, e)
+                failed[0] = True
+                raise  # Stop dynamics on error
+
+    # Attach observer and run full trajectory in one call
+    dyn.attach(observer, interval=1)
+
+    try:
+        # ✅ KEY FIX: Run entire trajectory in single call
+        # This allows ASE/xTB to optimize internally without Python loop overhead
+        dyn.run(total_steps)
+    except Exception as e:
+        LOGGER.error("QM trajectory failed: %s", e)
+        # Truncate arrays to saved frames
+        idx = save_idx[0]
+        positions = positions[:idx]
+        velocities = velocities[:idx]
+        forces = forces[:idx]
+        kinetic = kinetic[:idx]
+        potential = potential[:idx]
+        total_energy = total_energy[:idx]
     
     time_ps = compute_time_grid(len(positions), config.dt_fs, save_interval)
     metadata = {
@@ -275,15 +298,15 @@ def run_qm(smiles: str, name: str, out_dir: Path, config: QMConfig) -> Path:
         "num_atoms": int(n_atoms),
         "qm_method": config.method,
     }
-    
+
     out_dir = out_dir / name
     ensure_dir(out_dir)
     npz_path = out_dir / "trajectory.npz"
-    
+
     nve_serialised = json.dumps([
         {key: value.tolist() for key, value in window.items()} for window in nve_payload
     ])
-    
+
     np.savez(
         npz_path,
         pos=positions,
@@ -291,7 +314,7 @@ def run_qm(smiles: str, name: str, out_dir: Path, config: QMConfig) -> Path:
         forces=forces,
         Ekin=kinetic,
         Epot=potential,
-        Etot=total,
+        Etot=total_energy,
         box=np.tile(np.eye(3, dtype=np.float32), (len(positions), 1, 1)),
         masses=masses.astype(np.float32),
         atom_types=atomic_numbers.astype(np.int32),
