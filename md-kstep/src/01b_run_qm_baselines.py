@@ -13,8 +13,9 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-# Import only non-threaded libraries at module level
-# ASE/xTB imports MUST be deferred to run_qm() so worker_init sets OMP_NUM_THREADS first
+# Import only non-threaded libraries at module level.
+# ASE/xTB/RDKit imports MUST be deferred to run_qm() so worker_init
+# can set OMP_NUM_THREADS in each worker before those libraries load.
 from utils import configure_logging, ensure_dir, load_yaml, set_seed, compute_time_grid, LOGGER
 
 
@@ -157,15 +158,16 @@ def _worker_init(threads_per_worker: int) -> None:
     """Initialize worker process with proper threading limits.
 
     CRITICAL: This must run BEFORE any numerical libraries (xTB, numpy, scipy, etc.)
-    are imported, otherwise they will initialize their own threading pools.
+    are imported in the worker, otherwise they may initialize their own thread pools.
     """
     if threads_per_worker > 0:
+        # Use simple per-process thread limit; parallelism is across processes.
         os.environ["OMP_NUM_THREADS"] = str(threads_per_worker)
         os.environ["MKL_NUM_THREADS"] = str(threads_per_worker)
         os.environ["OPENBLAS_NUM_THREADS"] = str(threads_per_worker)
         os.environ["NUMEXPR_NUM_THREADS"] = str(threads_per_worker)
         os.environ.setdefault("OMP_STACKSIZE", "4G")
-        # Debug: confirm initialization (use print, logging may not be set up yet)
+        # Debug print (logging may not yet be configured in workers)
         print(f"[DEBUG Worker {os.getpid()}] Thread limits set: OMP={threads_per_worker}", flush=True)
 
 
@@ -388,20 +390,25 @@ def main() -> None:
             if len(parts) == 2:
                 smiles, name = parts
                 molecules.append((smiles, name))
-    
+
     LOGGER.info("Found %d molecules in %s", len(molecules), args.smiles_file)
-    
+
     # Filter if specific molecule requested
     if args.molecule:
         molecules = [(s, n) for s, n in molecules if n == args.molecule]
         if not molecules:
             LOGGER.error("Molecule %s not found in SMILES file", args.molecule)
             return
-    
+
     # Run trajectories (parallel if requested)
     num_workers = max(1, int(args.num_workers))
     if num_workers > 1 and len(molecules) > 1:
-        LOGGER.info("Running %d molecules with %d workers (%d threads per worker)", len(molecules), num_workers, threads_per_worker)
+        LOGGER.info(
+            "Running %d molecules with %d workers (%d threads per worker)",
+            len(molecules),
+            num_workers,
+            threads_per_worker,
+        )
         # Use initializer to set thread limits in each worker process BEFORE any libraries load
         initializer = partial(_worker_init, threads_per_worker)
         with ProcessPoolExecutor(max_workers=num_workers, initializer=initializer) as executor:
@@ -431,4 +438,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
