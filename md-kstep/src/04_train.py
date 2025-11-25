@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import json
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -14,7 +15,7 @@ import torch
 from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
 from torch.utils.data import DataLoader, Dataset
 
 from utils import (configure_logging, ensure_dir, load_yaml, set_seed,
@@ -72,10 +73,18 @@ class TrainConfig:
     struct_max_bonds: int | None = None
     struct_max_angles: int | None = None
     struct_max_dihedrals: int | None = None
+    # Learning rate warmup (fraction of total steps)
+    warmup_ratio: float = 0.05
+    # EMA decay rate (0 to disable, typical value 0.999 or 0.9999)
+    ema_decay: float = 0.0
+    # Uncertainty weighting for multi-task loss balancing (learnable log variances)
+    use_uncertainty_weighting: bool = False
+    # Curriculum learning: gradually increase structural penalty weights
+    curriculum_struct_epochs: int = 0  # 0 to disable
 
     @classmethod
     def from_dict(cls, data: Dict) -> "TrainConfig":
-        return cls(**data)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
 class KStepDataset(Dataset):
@@ -576,6 +585,195 @@ def _structural_losses(
     return bond_loss, angle_loss, dihedral_loss
 
 
+# --- Batched Structural Losses (vectorized across batch) ---
+
+def _structural_losses_batched(
+    pred_pos: torch.Tensor,
+    true_pos: torch.Tensor,
+    atom_types: torch.Tensor,
+    node_slices: torch.Tensor,
+    mol_names: List[str],
+    max_bonds: int | None = None,
+    max_angles: int | None = None,
+    max_dihedrals: int | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched structural loss computation with pre-allocated tensors."""
+    device = pred_pos.device
+    dtype = pred_pos.dtype
+    num_graphs = len(node_slices)
+
+    # Pre-collect all indices with graph offsets
+    all_bi, all_bj = [], []
+    all_ai, all_aj, all_ak = [], [], []
+    all_da, all_db, all_dc, all_dd = [], [], [], []
+    bond_graph_idx, angle_graph_idx, dih_graph_idx = [], [], []
+
+    start = 0
+    for idx_graph, count in enumerate(node_slices.tolist()):
+        end = start + count
+        mol = mol_names[idx_graph]
+        types = atom_types[start:end]
+        xt = true_pos[start:end]
+
+        idxs_t = _get_struct_indices_torch(mol, device, xt, types)
+        bi, bj = idxs_t["bonds_i"], idxs_t["bonds_j"]
+        ai, aj, ak = idxs_t["ang_i"], idxs_t["ang_j"], idxs_t["ang_k"]
+        da, db, dc, dd = idxs_t["dih_a"], idxs_t["dih_b"], idxs_t["dih_c"], idxs_t["dih_d"]
+
+        # Optional subsampling
+        if bi.numel() > 0:
+            (bi_s, bj_s), _ = _subsample_indices(device, max_bonds, bi, bj)
+            all_bi.append(bi_s + start)
+            all_bj.append(bj_s + start)
+            bond_graph_idx.extend([idx_graph] * bi_s.numel())
+
+        if ai.numel() > 0:
+            (ai_s, aj_s, ak_s), _ = _subsample_indices(device, max_angles, ai, aj, ak)
+            all_ai.append(ai_s + start)
+            all_aj.append(aj_s + start)
+            all_ak.append(ak_s + start)
+            angle_graph_idx.extend([idx_graph] * ai_s.numel())
+
+        if da.numel() > 0:
+            (da_s, db_s, dc_s, dd_s), _ = _subsample_indices(device, max_dihedrals, da, db, dc, dd)
+            all_da.append(da_s + start)
+            all_db.append(db_s + start)
+            all_dc.append(dc_s + start)
+            all_dd.append(dd_s + start)
+            dih_graph_idx.extend([idx_graph] * da_s.numel())
+
+        start = end
+
+    # Compute bond losses in batch
+    bond_loss = torch.zeros((), device=device, dtype=dtype)
+    if all_bi:
+        bi_cat = torch.cat(all_bi)
+        bj_cat = torch.cat(all_bj)
+        # Bond lengths in Angstrom
+        d_pred = (pred_pos[bi_cat] - pred_pos[bj_cat]) * 10.0
+        d_true = (true_pos[bi_cat] - true_pos[bj_cat]) * 10.0
+        bl_pred = torch.linalg.norm(d_pred, dim=-1)
+        bl_true = torch.linalg.norm(d_true, dim=-1)
+        bond_loss = torch.mean((bl_pred - bl_true) ** 2)
+
+    # Compute angle losses in batch
+    angle_loss = torch.zeros((), device=device, dtype=dtype)
+    if all_ai:
+        ai_cat = torch.cat(all_ai)
+        aj_cat = torch.cat(all_aj)
+        ak_cat = torch.cat(all_ak)
+
+        def compute_angles(x):
+            v1 = x[ai_cat] - x[aj_cat]
+            v2 = x[ak_cat] - x[aj_cat]
+            v1 = v1 / (torch.linalg.norm(v1, dim=-1, keepdim=True) + 1e-9)
+            v2 = v2 / (torch.linalg.norm(v2, dim=-1, keepdim=True) + 1e-9)
+            cos = torch.clamp((v1 * v2).sum(dim=-1), -1.0, 1.0)
+            return torch.acos(cos) * (180.0 / math.pi)
+
+        ang_pred = compute_angles(pred_pos)
+        ang_true = compute_angles(true_pos)
+        angle_loss = torch.mean((ang_pred - ang_true) ** 2)
+
+    # Compute dihedral losses in batch
+    dihedral_loss = torch.zeros((), device=device, dtype=dtype)
+    if all_da:
+        da_cat = torch.cat(all_da)
+        db_cat = torch.cat(all_db)
+        dc_cat = torch.cat(all_dc)
+        dd_cat = torch.cat(all_dd)
+
+        def compute_dihedrals(x):
+            b0 = x[db_cat] - x[da_cat]
+            b1 = x[dc_cat] - x[db_cat]
+            b2 = x[dd_cat] - x[dc_cat]
+            b1n = b1 / (torch.linalg.norm(b1, dim=-1, keepdim=True) + 1e-9)
+            v = b0 - (b0 * b1n).sum(dim=-1, keepdim=True) * b1n
+            w = b2 - (b2 * b1n).sum(dim=-1, keepdim=True) * b1n
+            xnum = (v * w).sum(dim=-1)
+            yden = torch.linalg.norm(torch.cross(v, b1n, dim=-1), dim=-1) * (torch.linalg.norm(w, dim=-1) + 1e-9)
+            return torch.atan2(yden, xnum + 1e-9) * (180.0 / math.pi)
+
+        dih_pred = compute_dihedrals(pred_pos)
+        dih_true = compute_dihedrals(true_pos)
+        dihedral_loss = torch.mean((dih_pred - dih_true) ** 2)
+
+    return bond_loss, angle_loss, dihedral_loss
+
+
+# --- EMA (Exponential Moving Average) for model weights ---
+
+class EMA:
+    """Exponential Moving Average of model weights."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+
+    def apply_shadow(self, model: nn.Module) -> None:
+        """Apply EMA weights to model (call before validation)."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self, model: nn.Module) -> None:
+        """Restore original weights after validation."""
+        for name, param in model.named_parameters():
+            if name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return {"shadow": self.shadow, "decay": self.decay}
+
+    def load_state_dict(self, state_dict: Dict) -> None:
+        self.shadow = state_dict["shadow"]
+        self.decay = state_dict.get("decay", self.decay)
+
+
+# --- Uncertainty Weighting for Multi-Task Loss Balancing ---
+
+class UncertaintyWeighting(nn.Module):
+    """Learnable uncertainty weighting for multi-task loss (Kendall et al., 2018).
+
+    Each task loss is weighted by exp(-log_var) and regularized by log_var.
+    This automatically balances loss components based on their homoscedastic uncertainty.
+    """
+
+    def __init__(self, num_tasks: int = 6):
+        super().__init__()
+        # Initialize log variances to 0 (equal weighting initially)
+        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
+
+    def forward(self, losses: List[torch.Tensor]) -> torch.Tensor:
+        """Combine losses with learned uncertainty weighting.
+
+        Args:
+            losses: List of scalar loss tensors
+
+        Returns:
+            Combined weighted loss with regularization
+        """
+        total = torch.zeros((), device=losses[0].device, dtype=losses[0].dtype)
+        for i, loss in enumerate(losses):
+            if i < len(self.log_vars):
+                precision = torch.exp(-self.log_vars[i])
+                total = total + precision * loss + 0.5 * self.log_vars[i]
+            else:
+                total = total + loss
+        return total
+
+
 def run_validation(
     model: nn.Module,
     loader: DataLoader,
@@ -584,8 +782,15 @@ def run_validation(
     pos_std: float,
     vel_std: float,
 ) -> Dict[str, float]:
+    """Run validation and return per-component losses for diagnostics."""
     model.eval()
-    losses = []
+    total_losses = []
+    pos_losses = []
+    vel_losses = []
+    bond_losses = []
+    angle_losses = []
+    dihedral_losses = []
+
     with torch.inference_mode():
         for batch in loader:
             batch = _move_to(batch, device)
@@ -596,9 +801,13 @@ def run_validation(
             loss_pos = torch.mean(((pred_pos - batch["x_t"]) / pos_std - (batch["x_tk"] - batch["x_t"]) / pos_std) ** 2)
             loss_vel = torch.mean(((pred_vel - batch["v_t"]) / vel_std - (batch["v_tk"] - batch["v_t"]) / vel_std) ** 2)
             loss = loss_pos + cfg.lambda_vel * loss_vel
-            # Optional structural penalties (use small weights; computed on positions only)
+
+            pos_losses.append(loss_pos.item())
+            vel_losses.append(loss_vel.item())
+
+            # Optional structural penalties (use batched version for efficiency)
             if cfg.lambda_struct_bond > 0 or cfg.lambda_struct_angle > 0 or cfg.lambda_struct_dihedral > 0:
-                b_loss, a_loss, d_loss = _structural_losses(
+                b_loss, a_loss, d_loss = _structural_losses_batched(
                     pred_pos,
                     batch["x_tk"],
                     batch["atom_types"],
@@ -614,9 +823,25 @@ def run_validation(
                     + cfg.lambda_struct_angle * a_loss
                     + cfg.lambda_struct_dihedral * d_loss
                 )
-            losses.append(loss.item())
+                bond_losses.append(b_loss.item())
+                angle_losses.append(a_loss.item())
+                dihedral_losses.append(d_loss.item())
+
+            total_losses.append(loss.item())
+
     model.train()
-    return {"val_loss": float(np.mean(losses)) if losses else float("nan")}
+
+    result = {
+        "val_loss": float(np.mean(total_losses)) if total_losses else float("nan"),
+        "val_loss_pos": float(np.mean(pos_losses)) if pos_losses else float("nan"),
+        "val_loss_vel": float(np.mean(vel_losses)) if vel_losses else float("nan"),
+    }
+    if bond_losses:
+        result["val_loss_bond"] = float(np.mean(bond_losses))
+        result["val_loss_angle"] = float(np.mean(angle_losses))
+        result["val_loss_dihedral"] = float(np.mean(dihedral_losses))
+
+    return result
 
 
 def save_checkpoint(state: Dict, path: Path) -> None:
@@ -749,18 +974,73 @@ def main() -> None:
         prefetch_factor=2 if train_cfg.num_workers > 0 else None,
     )
 
-    optimizer = AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
+    # Setup optimizer with optional uncertainty weighting parameters
+    uncertainty_weighting = None
+    if train_cfg.use_uncertainty_weighting:
+        uncertainty_weighting = UncertaintyWeighting(num_tasks=6).to(device)
+        optimizer = AdamW(
+            list(model.parameters()) + list(uncertainty_weighting.parameters()),
+            lr=train_cfg.lr,
+            weight_decay=train_cfg.weight_decay,
+        )
+        LOGGER.info("Using uncertainty weighting for multi-task loss balancing")
+    else:
+        optimizer = AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
+
     steps_per_epoch = max(len(train_loader), 1)
     total_steps = train_cfg.max_epochs * steps_per_epoch
-    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=train_cfg.lr_min)
+    # Account for gradient accumulation in optimizer step count
+    optimizer_steps = total_steps // max(train_cfg.grad_accum, 1)
+
+    # Setup scheduler with warmup
+    warmup_steps = int(optimizer_steps * train_cfg.warmup_ratio)
+    if warmup_steps > 0:
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=1e-8 / max(train_cfg.lr, 1e-8),
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=max(optimizer_steps - warmup_steps, 1),
+            eta_min=train_cfg.lr_min,
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_steps],
+        )
+        LOGGER.info("Using warmup scheduler: %d warmup steps, %d cosine steps", warmup_steps, optimizer_steps - warmup_steps)
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=optimizer_steps, eta_min=train_cfg.lr_min)
+
     scaler = GradScaler("cuda", enabled=train_cfg.amp)
 
+    # Setup EMA if enabled
+    ema = None
+    if train_cfg.ema_decay > 0:
+        ema = EMA(model, decay=train_cfg.ema_decay)
+        LOGGER.info("Using EMA with decay=%.6f", train_cfg.ema_decay)
+
+    # Track runtime and log ETA periodically
+    progress_interval = max(total_steps // 10, 1)
+    start_time = time.time()
     global_step = 0
+    optimizer_step_count = 0
     best_val = float("inf")
     optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(train_cfg.max_epochs):
         LOGGER.info("Epoch %d/%d", epoch + 1, train_cfg.max_epochs)
+
+        # Curriculum learning: gradually ramp up structural penalty weights
+        curriculum_factor = 1.0
+        if train_cfg.curriculum_struct_epochs > 0:
+            curriculum_factor = min(1.0, (epoch + 1) / train_cfg.curriculum_struct_epochs)
+            if epoch == 0 or (epoch + 1) == train_cfg.curriculum_struct_epochs:
+                LOGGER.info("Curriculum factor for structural penalties: %.3f", curriculum_factor)
+
         for batch in train_loader:
             batch = _move_to(batch, device)
             if train_cfg.random_rotate:
@@ -768,6 +1048,9 @@ def main() -> None:
             com_pos_loss = None
             momentum_loss = None
             force_reg = None
+            b_loss = None
+            a_loss = None
+            d_loss = None
             with autocast("cuda", enabled=train_cfg.amp):
                 outputs = model(batch)
                 pred_pos = batch["x_t"] + outputs["delta_pos"]
@@ -775,14 +1058,14 @@ def main() -> None:
                 # Standardized delta losses (per-component scalar std)
                 loss_pos = torch.mean(((pred_pos - batch["x_t"]) / pos_std - (batch["x_tk"] - batch["x_t"]) / pos_std) ** 2)
                 loss_vel = torch.mean(((pred_vel - batch["v_t"]) / vel_std - (batch["v_tk"] - batch["v_t"]) / vel_std) ** 2)
-                loss = loss_pos + train_cfg.lambda_vel * loss_vel
-                # Structural penalties
+
+                # Structural penalties (use batched version for efficiency)
                 if (
                     train_cfg.lambda_struct_bond > 0
                     or train_cfg.lambda_struct_angle > 0
                     or train_cfg.lambda_struct_dihedral > 0
                 ):
-                    b_loss, a_loss, d_loss = _structural_losses(
+                    b_loss, a_loss, d_loss = _structural_losses_batched(
                         pred_pos,
                         batch["x_tk"],
                         batch["atom_types"],
@@ -792,19 +1075,40 @@ def main() -> None:
                         getattr(train_cfg, "struct_max_angles", None),
                         getattr(train_cfg, "struct_max_dihedrals", None),
                     )
-                    loss = (
-                        loss
-                        + train_cfg.lambda_struct_bond * b_loss
-                        + train_cfg.lambda_struct_angle * a_loss
-                        + train_cfg.lambda_struct_dihedral * d_loss
-                    )
+
+                # COM and momentum losses
                 if train_cfg.lambda_com > 0:
                     com_pos_loss = _com_loss(pred_pos, batch["x_tk"], batch["masses"], batch["batch"])
                     momentum_loss = _momentum_loss(pred_vel, batch["v_tk"], batch["masses"], batch["batch"])
-                    loss = loss + train_cfg.lambda_com * (com_pos_loss + momentum_loss)
+
+                # Force regularization
                 if train_cfg.lambda_force > 0 and "force_pred" in outputs:
                     force_reg = torch.mean(outputs["force_pred"] ** 2)
-                    loss = loss + train_cfg.lambda_force * force_reg
+
+                # Combine losses with uncertainty weighting or fixed weights
+                if uncertainty_weighting is not None:
+                    # Collect all loss components for uncertainty weighting
+                    loss_components = [loss_pos, loss_vel]
+                    if b_loss is not None:
+                        loss_components.extend([b_loss, a_loss, d_loss])
+                    if com_pos_loss is not None:
+                        loss_components.append(com_pos_loss + momentum_loss)
+                    if force_reg is not None:
+                        loss_components.append(force_reg)
+                    loss = uncertainty_weighting(loss_components)
+                else:
+                    # Traditional fixed-weight combination
+                    loss = loss_pos + train_cfg.lambda_vel * loss_vel
+                    if b_loss is not None:
+                        # Apply curriculum factor to structural penalties
+                        effective_bond = train_cfg.lambda_struct_bond * curriculum_factor
+                        effective_angle = train_cfg.lambda_struct_angle * curriculum_factor
+                        effective_dihedral = train_cfg.lambda_struct_dihedral * curriculum_factor
+                        loss = loss + effective_bond * b_loss + effective_angle * a_loss + effective_dihedral * d_loss
+                    if com_pos_loss is not None:
+                        loss = loss + train_cfg.lambda_com * (com_pos_loss + momentum_loss)
+                    if force_reg is not None:
+                        loss = loss + train_cfg.lambda_force * force_reg
 
             current_step = global_step + 1
             metrics_entry: Dict[str, float | int] = {
@@ -813,12 +1117,21 @@ def main() -> None:
                 "loss": float(loss.detach().item()),
                 "loss_pos": float(loss_pos.detach().item()),
                 "loss_vel": float(loss_vel.detach().item()),
+                "lr": float(optimizer.param_groups[0]["lr"]),
             }
+            if b_loss is not None:
+                metrics_entry["loss_bond"] = float(b_loss.detach().item())
+                metrics_entry["loss_angle"] = float(a_loss.detach().item())
+                metrics_entry["loss_dihedral"] = float(d_loss.detach().item())
             if com_pos_loss is not None and momentum_loss is not None:
                 metrics_entry["loss_com"] = float(com_pos_loss.detach().item())
                 metrics_entry["loss_momentum"] = float(momentum_loss.detach().item())
             if force_reg is not None:
                 metrics_entry["loss_force"] = float(force_reg.detach().item())
+            if uncertainty_weighting is not None:
+                # Log learned log variances (task uncertainties)
+                for i, lv in enumerate(uncertainty_weighting.log_vars.detach().cpu().tolist()):
+                    metrics_entry[f"log_var_{i}"] = float(lv)
             train_metrics.append(metrics_entry)
 
             scaler.scale(loss / train_cfg.grad_accum).backward()
@@ -831,38 +1144,86 @@ def main() -> None:
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
+                optimizer_step_count += 1
+
+                # Update EMA after optimizer step
+                if ema is not None:
+                    ema.update(model)
 
             global_step += 1
 
+            if global_step % progress_interval == 0:
+                elapsed_sec = time.time() - start_time
+                progress_frac = global_step / max(total_steps, 1)
+                estimated_total_sec = elapsed_sec / progress_frac
+                eta_sec = max(estimated_total_sec - elapsed_sec, 0.0)
+                LOGGER.info(
+                    "Progress: %d/%d steps (%.1f%%) | Elapsed: %.1f min | ETA: %.1f min",
+                    global_step,
+                    total_steps,
+                    100 * progress_frac,
+                    elapsed_sec / 60,
+                    eta_sec / 60,
+                )
+
             if train_cfg.val_every_steps > 0 and global_step % train_cfg.val_every_steps == 0:
+                # Apply EMA weights for validation if enabled
+                if ema is not None:
+                    ema.apply_shadow(model)
+
                 metrics = run_validation(model, val_loader, device, train_cfg, pos_std, vel_std)
-                LOGGER.info("Step %d: val_loss=%.6f", global_step, metrics["val_loss"])
-                val_metrics.append({
+
+                # Restore original weights after validation
+                if ema is not None:
+                    ema.restore(model)
+
+                # Log validation with per-component losses
+                log_msg = f"Step {global_step}: val_loss={metrics['val_loss']:.6f}"
+                if "val_loss_pos" in metrics:
+                    log_msg += f" | pos={metrics['val_loss_pos']:.6f}"
+                if "val_loss_vel" in metrics:
+                    log_msg += f" | vel={metrics['val_loss_vel']:.6f}"
+                LOGGER.info(log_msg)
+
+                # Store all validation metrics
+                val_entry = {
                     "step": int(global_step),
                     "epoch": int(epoch + 1),
-                    "val_loss": float(metrics["val_loss"]),
-                })
+                }
+                val_entry.update(metrics)
+                val_metrics.append(val_entry)
+
                 if metrics["val_loss"] < best_val:
                     best_val = metrics["val_loss"]
                     checkpoint_path = Path(train_cfg.checkpoint_dir) / "best.pt"
-                    save_checkpoint({
+                    checkpoint_state = {
                         "model": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(),
                         "step": global_step,
                         "epoch": epoch,
                         "val_loss": best_val,
-                    }, checkpoint_path)
+                    }
+                    # Save EMA weights separately if enabled
+                    if ema is not None:
+                        checkpoint_state["ema"] = ema.state_dict()
+                        # Also save a separate checkpoint with just EMA weights for inference
+                        ema_checkpoint_path = Path(train_cfg.checkpoint_dir) / "best_ema.pt"
+                        save_checkpoint({"model": ema.shadow}, ema_checkpoint_path)
+                    save_checkpoint(checkpoint_state, checkpoint_path)
 
             if train_cfg.checkpoint_every_steps > 0 and global_step % train_cfg.checkpoint_every_steps == 0:
                 checkpoint_path = Path(train_cfg.checkpoint_dir) / f"step_{global_step}.pt"
-                save_checkpoint({
+                checkpoint_state = {
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
                     "step": global_step,
                     "epoch": epoch,
-                }, checkpoint_path)
+                }
+                if ema is not None:
+                    checkpoint_state["ema"] = ema.state_dict()
+                save_checkpoint(checkpoint_state, checkpoint_path)
 
             if global_step >= total_steps:
                 break
@@ -872,7 +1233,8 @@ def main() -> None:
     _write_jsonl(train_log_path, train_metrics)
     _write_jsonl(val_log_path, val_metrics)
 
-    LOGGER.info("Training complete. Best val_loss=%.6f", best_val)
+    total_elapsed_min = (time.time() - start_time) / 60
+    LOGGER.info("Training complete in %.1f min. Best val_loss=%.6f", total_elapsed_min, best_val)
 
 
 if __name__ == "__main__":
