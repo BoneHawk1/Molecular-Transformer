@@ -607,6 +607,9 @@ def _structural_losses_batched(
     all_ai, all_aj, all_ak = [], [], []
     all_da, all_db, all_dc, all_dd = [], [], [], []
     bond_graph_idx, angle_graph_idx, dih_graph_idx = [], [], []
+    bond_scales = torch.ones(num_graphs, device=device, dtype=dtype)
+    angle_scales = torch.ones(num_graphs, device=device, dtype=dtype)
+    dihedral_scales = torch.ones(num_graphs, device=device, dtype=dtype)
 
     start = 0
     for idx_graph, count in enumerate(node_slices.tolist()):
@@ -622,25 +625,28 @@ def _structural_losses_batched(
 
         # Optional subsampling
         if bi.numel() > 0:
-            (bi_s, bj_s), _ = _subsample_indices(device, max_bonds, bi, bj)
+            (bi_s, bj_s), scale_b = _subsample_indices(device, max_bonds, bi, bj)
             all_bi.append(bi_s + start)
             all_bj.append(bj_s + start)
             bond_graph_idx.extend([idx_graph] * bi_s.numel())
+            bond_scales[idx_graph] = float(scale_b)
 
         if ai.numel() > 0:
-            (ai_s, aj_s, ak_s), _ = _subsample_indices(device, max_angles, ai, aj, ak)
+            (ai_s, aj_s, ak_s), scale_a = _subsample_indices(device, max_angles, ai, aj, ak)
             all_ai.append(ai_s + start)
             all_aj.append(aj_s + start)
             all_ak.append(ak_s + start)
             angle_graph_idx.extend([idx_graph] * ai_s.numel())
+            angle_scales[idx_graph] = float(scale_a)
 
         if da.numel() > 0:
-            (da_s, db_s, dc_s, dd_s), _ = _subsample_indices(device, max_dihedrals, da, db, dc, dd)
+            (da_s, db_s, dc_s, dd_s), scale_d = _subsample_indices(device, max_dihedrals, da, db, dc, dd)
             all_da.append(da_s + start)
             all_db.append(db_s + start)
             all_dc.append(dc_s + start)
             all_dd.append(dd_s + start)
             dih_graph_idx.extend([idx_graph] * da_s.numel())
+            dihedral_scales[idx_graph] = float(scale_d)
 
         start = end
 
@@ -649,12 +655,19 @@ def _structural_losses_batched(
     if all_bi:
         bi_cat = torch.cat(all_bi)
         bj_cat = torch.cat(all_bj)
+        bond_graph_idx_t = torch.as_tensor(bond_graph_idx, device=device, dtype=torch.long)
         # Bond lengths in Angstrom
         d_pred = (pred_pos[bi_cat] - pred_pos[bj_cat]) * 10.0
         d_true = (true_pos[bi_cat] - true_pos[bj_cat]) * 10.0
         bl_pred = torch.linalg.norm(d_pred, dim=-1)
         bl_true = torch.linalg.norm(d_true, dim=-1)
-        bond_loss = torch.mean((bl_pred - bl_true) ** 2)
+        bl_err = (bl_pred - bl_true) ** 2
+        bond_counts = _scatter_sum(torch.ones_like(bl_err), bond_graph_idx_t, num_graphs)
+        bond_sums = _scatter_sum(bl_err, bond_graph_idx_t, num_graphs)
+        bond_mask = bond_counts > 0
+        bond_per_graph = torch.zeros(num_graphs, device=device, dtype=dtype)
+        bond_per_graph[bond_mask] = (bond_sums[bond_mask] / bond_counts[bond_mask]) * bond_scales[bond_mask]
+        bond_loss = bond_per_graph[bond_mask].mean() if bond_mask.any() else bond_loss
 
     # Compute angle losses in batch
     angle_loss = torch.zeros((), device=device, dtype=dtype)
@@ -662,6 +675,7 @@ def _structural_losses_batched(
         ai_cat = torch.cat(all_ai)
         aj_cat = torch.cat(all_aj)
         ak_cat = torch.cat(all_ak)
+        angle_graph_idx_t = torch.as_tensor(angle_graph_idx, device=device, dtype=torch.long)
 
         def compute_angles(x):
             v1 = x[ai_cat] - x[aj_cat]
@@ -673,7 +687,13 @@ def _structural_losses_batched(
 
         ang_pred = compute_angles(pred_pos)
         ang_true = compute_angles(true_pos)
-        angle_loss = torch.mean((ang_pred - ang_true) ** 2)
+        ang_err = (ang_pred - ang_true) ** 2
+        angle_counts = _scatter_sum(torch.ones_like(ang_err), angle_graph_idx_t, num_graphs)
+        angle_sums = _scatter_sum(ang_err, angle_graph_idx_t, num_graphs)
+        angle_mask = angle_counts > 0
+        angle_per_graph = torch.zeros(num_graphs, device=device, dtype=dtype)
+        angle_per_graph[angle_mask] = (angle_sums[angle_mask] / angle_counts[angle_mask]) * angle_scales[angle_mask]
+        angle_loss = angle_per_graph[angle_mask].mean() if angle_mask.any() else angle_loss
 
     # Compute dihedral losses in batch
     dihedral_loss = torch.zeros((), device=device, dtype=dtype)
@@ -682,6 +702,7 @@ def _structural_losses_batched(
         db_cat = torch.cat(all_db)
         dc_cat = torch.cat(all_dc)
         dd_cat = torch.cat(all_dd)
+        dih_graph_idx_t = torch.as_tensor(dih_graph_idx, device=device, dtype=torch.long)
 
         def compute_dihedrals(x):
             b0 = x[db_cat] - x[da_cat]
@@ -696,7 +717,13 @@ def _structural_losses_batched(
 
         dih_pred = compute_dihedrals(pred_pos)
         dih_true = compute_dihedrals(true_pos)
-        dihedral_loss = torch.mean((dih_pred - dih_true) ** 2)
+        dih_err = (dih_pred - dih_true) ** 2
+        dih_counts = _scatter_sum(torch.ones_like(dih_err), dih_graph_idx_t, num_graphs)
+        dih_sums = _scatter_sum(dih_err, dih_graph_idx_t, num_graphs)
+        dih_mask = dih_counts > 0
+        dih_per_graph = torch.zeros(num_graphs, device=device, dtype=dtype)
+        dih_per_graph[dih_mask] = (dih_sums[dih_mask] / dih_counts[dih_mask]) * dihedral_scales[dih_mask]
+        dihedral_loss = dih_per_graph[dih_mask].mean() if dih_mask.any() else dihedral_loss
 
     return bond_loss, angle_loss, dihedral_loss
 
@@ -880,6 +907,7 @@ def main() -> None:
     model_cfg = load_yaml(args.model_config)
     train_cfg = TrainConfig.from_dict(load_yaml(args.train_config))
     set_seed(train_cfg.seed)
+    grad_accum = max(train_cfg.grad_accum, 1)
 
     # Redirect checkpoints for transformer architecture to a dedicated folder
     try:
@@ -987,10 +1015,20 @@ def main() -> None:
     else:
         optimizer = AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
 
-    steps_per_epoch = max(len(train_loader), 1)
+    if train_cfg.steps_per_epoch > 0:
+        if train_cfg.steps_per_epoch != len(train_loader):
+            LOGGER.info(
+                "Using configured steps_per_epoch=%d (data loader len=%d)",
+                train_cfg.steps_per_epoch,
+                len(train_loader),
+            )
+        steps_per_epoch = train_cfg.steps_per_epoch
+    else:
+        steps_per_epoch = max(len(train_loader), 1)
+
     total_steps = train_cfg.max_epochs * steps_per_epoch
-    # Account for gradient accumulation in optimizer step count
-    optimizer_steps = total_steps // max(train_cfg.grad_accum, 1)
+    # Account for gradient accumulation in optimizer step count (ceiling for remainder batches)
+    optimizer_steps = math.ceil(total_steps / grad_accum)
 
     # Setup scheduler with warmup
     warmup_steps = int(optimizer_steps * train_cfg.warmup_ratio)
@@ -1029,6 +1067,29 @@ def main() -> None:
     global_step = 0
     optimizer_step_count = 0
     best_val = float("inf")
+
+    def _step_optimizer(accum_steps: int) -> None:
+        """Perform an optimizer step, correcting for partial accumulation if needed."""
+        nonlocal optimizer_step_count
+        if accum_steps <= 0:
+            return
+        scaler.unscale_(optimizer)
+        if accum_steps != grad_accum:
+            scale_correction = float(grad_accum) / float(accum_steps)
+            for param_group in optimizer.param_groups:
+                for param in param_group["params"]:
+                    if param is not None and param.grad is not None:
+                        param.grad.mul_(scale_correction)
+        if train_cfg.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
+        optimizer_step_count += 1
+        if ema is not None:
+            ema.update(model)
+
     optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(train_cfg.max_epochs):
@@ -1134,21 +1195,10 @@ def main() -> None:
                     metrics_entry[f"log_var_{i}"] = float(lv)
             train_metrics.append(metrics_entry)
 
-            scaler.scale(loss / train_cfg.grad_accum).backward()
+            scaler.scale(loss / grad_accum).backward()
 
-            if (global_step + 1) % train_cfg.grad_accum == 0:
-                if train_cfg.grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
-                optimizer_step_count += 1
-
-                # Update EMA after optimizer step
-                if ema is not None:
-                    ema.update(model)
+            if (global_step + 1) % grad_accum == 0:
+                _step_optimizer(grad_accum)
 
             global_step += 1
 
@@ -1227,6 +1277,12 @@ def main() -> None:
 
             if global_step >= total_steps:
                 break
+
+        # Flush any leftover gradients that did not trigger an optimizer step
+        remainder = global_step % grad_accum
+        if remainder != 0:
+            _step_optimizer(remainder)
+
         if global_step >= total_steps:
             break
 
