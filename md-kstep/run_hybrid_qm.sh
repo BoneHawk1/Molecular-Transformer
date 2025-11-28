@@ -4,7 +4,7 @@
 
 set -e
 
-CHECKPOINT="outputs/checkpoints_qm/best.pt"
+CHECKPOINT="outputs/checkpoints_transformer_qm/best.pt"
 MODEL_CONFIG="configs/model_qm.yaml"
 QM_CONFIG="configs/qm.yaml"
 QM_TRAJ_DIR="data/qm"
@@ -38,7 +38,12 @@ for mol_dir in "$QM_TRAJ_DIR"/*; do
                 --frame 0 \
                 --steps $STEPS \
                 --k-steps $K_STEPS \
-                --device cuda
+                --device cuda \
+                --max-delta-pos 0.02 \
+                --max-delta-vel 2.0 \
+                --delta-scale 0.5 \
+                --pos-threshold 1.0 \
+                --vel-threshold 30.0
         else
             echo "Skipping $mol_name (no trajectory found)"
         fi
@@ -48,4 +53,3 @@ done
 echo ""
 echo "Hybrid QM integration complete!"
 echo "Results saved to: $OUT_DIR"
-

@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -22,10 +22,30 @@ COVALENT_RADII = {
 }
 
 
+def _parse_json_field(raw: Any, expected: Union[type, Tuple[type, ...]], default: Any) -> Any:
+    """Decode JSON-serialised NPZ fields, falling back to Python objects."""
+    if raw is None:
+        return default
+    if isinstance(raw, np.ndarray):
+        # np.load wraps pickled objects/strings in 0-d arrays
+        if raw.shape == ():
+            return _parse_json_field(raw.item(), expected, default)
+        raw = raw.tolist()
+    if isinstance(raw, expected):
+        return raw
+    if isinstance(raw, (str, bytes)):
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError:
+            return default
+        return loaded if isinstance(loaded, expected) else default
+    return default
+
+
 def load_npz(path: Path) -> Dict:
     data = np.load(path, allow_pickle=True)
-    metadata = json.loads(str(data["metadata"])) if "metadata" in data else {}
-    nve_windows = json.loads(str(data.get("nve_windows", "[]")))
+    metadata = _parse_json_field(data.get("metadata"), dict, {})
+    nve_windows = _parse_json_field(data.get("nve_windows"), list, [])
     trajectory = {
         "pos": data["pos"],
         "vel": data["vel"],

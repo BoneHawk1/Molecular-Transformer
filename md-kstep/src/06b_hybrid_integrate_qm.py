@@ -15,8 +15,8 @@ import torch
 
 try:
     from ase import Atoms, units
-    from ase.calculators.xtb import XTB
-    from ase.md.velocityverlet import VelocityVerlet
+    from xtb.ase.calculator import XTB
+    from ase.md.verlet import VelocityVerlet
     from ase.md.langevin import Langevin
 except ImportError as e:
     raise ImportError("QM hybrid integrator requires: pip install ase; conda install -c conda-forge xtb") from e
@@ -373,12 +373,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int, default=100, help="Number of hybrid integration steps")
     parser.add_argument("--k-steps", type=int, default=4, help="k-step horizon (must match training)")
     parser.add_argument("--device", default="cuda", help="Torch device")
-    parser.add_argument("--max-delta-pos", type=float, default=0.05, help="Max position delta per atom (nm)")
-    parser.add_argument("--max-delta-vel", type=float, default=5.0, help="Max velocity delta per atom (nm/ps)")
-    parser.add_argument("--delta-scale", type=float, default=1.0, help="Initial scaling for ML predictions")
+    parser.add_argument("--max-delta-pos", type=float, default=0.02, help="Max position delta per atom (nm)")
+    parser.add_argument("--max-delta-vel", type=float, default=2.0, help="Max velocity delta per atom (nm/ps)")
+    parser.add_argument("--delta-scale", type=float, default=0.5, help="Initial scaling for ML predictions")
     parser.add_argument("--max-attempts", type=int, default=5, help="Max retry attempts per step")
-    parser.add_argument("--pos-threshold", type=float, default=2.0, help="Max position magnitude (nm)")
-    parser.add_argument("--vel-threshold", type=float, default=50.0, help="Max velocity magnitude (nm/ps)")
+    parser.add_argument("--pos-threshold", type=float, default=1.0, help="Max position magnitude (nm)")
+    parser.add_argument("--vel-threshold", type=float, default=30.0, help="Max velocity magnitude (nm/ps)")
     return parser
 
 
@@ -447,4 +447,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

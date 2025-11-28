@@ -1,6 +1,9 @@
 #!/bin/bash
 # Train QM k-step model with transfer learning from MM model
 # Usage: bash train_qm.sh
+# For a live terminal UI of training/validation loss, run:
+#   python scripts/qm_train_tui.py
+# in a separate terminal while this script is running.
 
 set -e
 
@@ -27,6 +30,9 @@ else
     PRETRAINED_FLAG="--pretrained $PRETRAINED"
 fi
 
+# For QM transfer learning, start by freezing a few early layers
+FREEZE_LAYERS=2
+
 python src/04_train.py \
     --dataset "$QM_DATASET" \
     --model-config "$MODEL_CONFIG" \
@@ -34,9 +40,8 @@ python src/04_train.py \
     --splits "$TRAIN_SPLIT" "$VAL_SPLIT" \
     --device cuda \
     $PRETRAINED_FLAG \
-    --freeze-layers 0
+    --freeze-layers $FREEZE_LAYERS
 
 echo ""
 echo "QM training complete!"
 echo "Checkpoints saved to: outputs/checkpoints_qm/"
-

@@ -81,6 +81,8 @@ class TrainConfig:
     use_uncertainty_weighting: bool = False
     # Curriculum learning: gradually increase structural penalty weights
     curriculum_struct_epochs: int = 0  # 0 to disable
+    # Validation batch limit (0 = unlimited, N = limit to N batches for speed)
+    max_val_batches: int = 0
 
     @classmethod
     def from_dict(cls, data: Dict) -> "TrainConfig":
@@ -819,7 +821,11 @@ def run_validation(
     dihedral_losses = []
 
     with torch.inference_mode():
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
+            # Respect max_val_batches if configured (for speed with large validation sets)
+            if cfg.max_val_batches > 0 and batch_idx >= cfg.max_val_batches:
+                break
+
             batch = _move_to(batch, device)
             outputs = model(batch)
             pred_pos = batch["x_t"] + outputs["delta_pos"]
@@ -881,6 +887,13 @@ def _write_jsonl(path: Path, records: Iterable[Dict]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record) + "\n")
+
+
+def _append_jsonl_record(path: Path, record: Dict) -> None:
+    """Append a single JSON record to a JSONL log file."""
+    ensure_dir(path.parent)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -1194,6 +1207,7 @@ def main() -> None:
                 for i, lv in enumerate(uncertainty_weighting.log_vars.detach().cpu().tolist()):
                     metrics_entry[f"log_var_{i}"] = float(lv)
             train_metrics.append(metrics_entry)
+            _append_jsonl_record(train_log_path, metrics_entry)
 
             scaler.scale(loss / grad_accum).backward()
 
@@ -1242,6 +1256,7 @@ def main() -> None:
                 }
                 val_entry.update(metrics)
                 val_metrics.append(val_entry)
+                _append_jsonl_record(val_log_path, val_entry)
 
                 if metrics["val_loss"] < best_val:
                     best_val = metrics["val_loss"]
@@ -1285,9 +1300,6 @@ def main() -> None:
 
         if global_step >= total_steps:
             break
-
-    _write_jsonl(train_log_path, train_metrics)
-    _write_jsonl(val_log_path, val_metrics)
 
     total_elapsed_min = (time.time() - start_time) / 60
     LOGGER.info("Training complete in %.1f min. Best val_loss=%.6f", total_elapsed_min, best_val)
