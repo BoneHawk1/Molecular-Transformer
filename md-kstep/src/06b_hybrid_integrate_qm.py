@@ -213,6 +213,7 @@ def run_hybrid_qm(
     max_attempts: int,
     pos_threshold: float,
     vel_threshold: float,
+    energy_rescale: bool = False,
 ) -> Dict[str, np.ndarray]:
     """Run hybrid QM integration: k-step ML jump + xTB corrector."""
     
@@ -327,7 +328,28 @@ def run_hybrid_qm(
             centered_pos = current_pos_np
             centered_vel = current_vel_np
             correction = {"Ekin": float('nan'), "Epot": float('nan')}
-        
+
+        # Optional energy rescaling to reduce systematic drift
+        if energy_rescale:
+            prev_Ekin = trajectory_Ekin[step_idx]
+            prev_Epot = trajectory_Epot[step_idx]
+            Ekin_new = correction.get("Ekin", float("nan"))
+            Epot_new = correction.get("Epot", float("nan"))
+
+            if (
+                np.isfinite(prev_Ekin)
+                and np.isfinite(prev_Epot)
+                and np.isfinite(Ekin_new)
+                and np.isfinite(Epot_new)
+                and Ekin_new > 0.0
+            ):
+                prev_Etot = prev_Ekin + prev_Epot
+                target_Ekin = prev_Etot - Epot_new
+                if target_Ekin > 0.0:
+                    scale_factor = np.sqrt(target_Ekin / Ekin_new)
+                    centered_vel = centered_vel * scale_factor
+                    correction["Ekin"] = Ekin_new * (scale_factor ** 2)
+
         # Update state
         positions = torch.from_numpy(centered_pos).float().to(device)
         velocities = torch.from_numpy(centered_vel).float().to(device)
@@ -378,7 +400,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--delta-scale", type=float, default=0.5, help="Initial scaling for ML predictions")
     parser.add_argument("--max-attempts", type=int, default=5, help="Max retry attempts per step")
     parser.add_argument("--pos-threshold", type=float, default=1.0, help="Max position magnitude (nm)")
-    parser.add_argument("--vel-threshold", type=float, default=30.0, help="Max velocity magnitude (nm/ps)")
+    parser.add_argument("--vel-threshold", type=float, default=50.0, help="Max velocity magnitude (nm/ps)")
+    parser.add_argument(
+        "--energy-rescale",
+        action="store_true",
+        help="Rescale velocities after each corrector step to conserve total energy",
+    )
     return parser
 
 
@@ -412,6 +439,7 @@ def main() -> None:
         max_attempts=args.max_attempts,
         pos_threshold=args.pos_threshold,
         vel_threshold=args.vel_threshold,
+        energy_rescale=args.energy_rescale,
     )
     
     # Save trajectory

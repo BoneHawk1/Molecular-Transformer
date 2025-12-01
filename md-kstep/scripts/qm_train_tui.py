@@ -89,9 +89,10 @@ def _update_buffers(
         buffers.values.append(value_float)
         buffers.last_record = rec
 
-    if len(buffers.steps) > max_points:
-        buffers.steps = buffers.steps[-max_points:]
-        buffers.values = buffers.values[-max_points:]
+    # Keep the full history so the plot always reflects all
+    # available data, scaled to the current window. The
+    # max_points argument is retained for compatibility but
+    # no longer used to enforce a sliding window.
 
 
 def _draw_centered(stdscr: "curses._CursesWindow", row: int, text: str) -> None:
@@ -319,4 +320,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

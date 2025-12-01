@@ -5,8 +5,8 @@
 set -e
 
 BASELINE="data/qm"
-HYBRID="outputs/hybrid_qm"
-OUT_DIR="outputs/eval_qm"
+HYBRID="outputs/hybrid_qm_scratch"
+OUT_DIR="outputs/eval_qm_scratch"
 
 echo "Evaluating QM hybrid integrator"
 echo "Baseline: $BASELINE"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Train QM k-step model with transfer learning from MM model
+# Train QM k-step model from scratch
 # Usage: bash train_qm.sh
 # For a live terminal UI of training/validation loss, run:
 #   python scripts/qm_train_tui.py
@@ -13,35 +13,19 @@ MODEL_CONFIG="configs/model_qm.yaml"
 TRAIN_CONFIG="configs/train_qm.yaml"
 TRAIN_SPLIT="data/qm_splits/train.json"
 VAL_SPLIT="data/qm_splits/val.json"
-PRETRAINED="outputs/checkpoints_transformer_aug_wide/best.pt"  # MM pretrained model
 
-echo "Training QM k-step model with transfer learning"
+echo "Training QM k-step model from scratch"
 echo "Dataset: $QM_DATASET"
-echo "Pretrained: $PRETRAINED"
+echo "Config: $TRAIN_CONFIG"
 echo ""
-
-# Check if pretrained checkpoint exists
-if [ ! -f "$PRETRAINED" ]; then
-    echo "WARNING: Pretrained checkpoint not found at $PRETRAINED"
-    echo "Training from scratch instead..."
-    PRETRAINED_FLAG=""
-else
-    echo "Using pretrained MM model: $PRETRAINED"
-    PRETRAINED_FLAG="--pretrained $PRETRAINED"
-fi
-
-# For QM transfer learning, start by freezing a few early layers
-FREEZE_LAYERS=2
 
 python src/04_train.py \
     --dataset "$QM_DATASET" \
     --model-config "$MODEL_CONFIG" \
     --train-config "$TRAIN_CONFIG" \
     --splits "$TRAIN_SPLIT" "$VAL_SPLIT" \
-    --device cuda \
-    $PRETRAINED_FLAG \
-    --freeze-layers $FREEZE_LAYERS
+    --device cuda
 
 echo ""
 echo "QM training complete!"
-echo "Checkpoints saved to: outputs/checkpoints_qm/"
+echo "Checkpoints saved to: outputs/checkpoints_qm_scratch/"
