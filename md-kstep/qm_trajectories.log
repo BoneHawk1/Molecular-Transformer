@@ -1,0 +1,68 @@
+nohup: ignoring input
+Generating xTB QM trajectories for molecules in data/qm_molecules.smi
+Output directory: data/qm
+Config: configs/qm.yaml
+
+[INFO] Setting default OMP_NUM_THREADS=1 for parallel workers (override with --omp-num-threads)
+[INFO] Found 22 molecules in data/qm_molecules.smi
+[INFO] Running 22 molecules with 20 workers (OMP_NUM_THREADS=1)
+[INFO] Setting up QM trajectory for glycine (SMILES: C(C(=O)O)N)
+[INFO] Setting up QM trajectory for alanine (SMILES: CC(C(=O)O)N)
+[INFO] Setting up QM trajectory for serine (SMILES: C(C(C(=O)O)N)O)
+[INFO] Setting up QM trajectory for valine (SMILES: CC(C)C(C(=O)O)N)
+[INFO] Setting up QM trajectory for N-methylalanine (SMILES: CC(C(=O)O)N(C)C)
+[INFO] Setting up QM trajectory for adenine (SMILES: C1=NC(=NC2=C1N=CN2)N)
+[INFO] Setting up QM trajectory for imidazole (SMILES: C1=CNC=N1)
+[INFO] Setting up QM trajectory for toluene (SMILES: CC1=CC=CC=C1)
+[INFO] Setting up QM trajectory for pyridine (SMILES: C1=CC=NC=C1)
+[INFO] Setting up QM trajectory for benzene (SMILES: C1=CC=CC=C1)
+[INFO] Setting up QM trajectory for imidazole_deriv (SMILES: C1=CN(C=NC1=N)C)
+[INFO] Setting up QM trajectory for aniline (SMILES: C1=CC=C(C=C1)N)
+[INFO] Setting up QM trajectory for phenol (SMILES: C1=CC=C(C=C1)O)
+[INFO] Setting up QM trajectory for thymine (SMILES: CC1=CNC(=O)NC1=O)
+[INFO] Setting up QM trajectory for indole (SMILES: C1=CC=C2C(=C1)C=CN2)
+[INFO] Setting up QM trajectory for glycolic_acid (SMILES: C(C(=O)O)O)
+[INFO] Setting up QM trajectory for formic_acid (SMILES: C(=O)O)
+[INFO] Setting up QM trajectory for tetrahydrofuran (SMILES: C1CCOC1)
+[INFO] Setting up QM trajectory for tetrahydrothiophene (SMILES: C1CCSC1)
+[INFO] Setting up QM trajectory for acetic_acid (SMILES: CC(=O)O)
+[INFO] Molecule has 12 atoms
+[INFO] Molecule has 11 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 15 atoms
+[INFO] Molecule has 9 atoms
+[INFO] Molecule has 5 atoms
+[INFO] Molecule has 8 atoms
+[INFO] Molecule has 13 atoms
+[INFO] Molecule has 14 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 13 atoms
+[INFO] Molecule has 19 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 10 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 9 atoms
+[INFO] Molecule has 15 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 16 atoms
+[INFO] Molecule has 13 atoms
+[INFO] Molecule has 19 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 14 atoms
+[INFO] Molecule has 13 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 15 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 15 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)

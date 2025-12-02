@@ -1,0 +1,12 @@
+temperature_K: 300.0
+friction_per_ps: 0.002
+dt_fs: 0.25
+length_ps: 5.0  # Short test trajectory (5 ps = 20,000 steps)
+save_interval_steps: 1
+method: GFN2-xTB
+random_seed: 42
+charge: 0
+spin_multiplicity: 1
+equilibration_ps: 1.0  # Short equilibration
+nve_window_ps: 0.0  # Disable NVE for speed test
+nve_every_ps: 0.0

@@ -1,0 +1,18 @@
+temperature_K: 300.0
+friction_per_ps: 0.01
+dt_fs: 0.5
+length_ps: 5.0
+save_interval_steps: 5
+method: rhf
+basis: sto-3g
+xc: pbe
+random_seed: 42
+charge: 0
+spin: 0
+equilibration_ps: 0.5
+conv_tol: 1.0e-8
+max_cycle: 100
+use_gpu: true
+nve_window_ps: 0.0
+nve_every_ps: 0.0
+

@@ -1,0 +1,47 @@
+seed: 42
+k_steps: 4  # 1 fs macro-step = 4 × 0.25 fs
+batch_size: 512  # Larger batch for from-scratch training with 5.6M samples
+grad_accum: 2  # Effective batch size 1024
+num_workers: 10
+lr: 1.0e-4  # Full LR for from-scratch training (not fine-tuning)
+lr_min: 1.0e-5
+warmup_ratio: 0.1  # 10% warmup for stability when training from random weights
+weight_decay: 1.0e-3  # Lighter regularization for from-scratch (no catastrophic forgetting risk)
+max_epochs: 12  # More epochs needed for from-scratch training
+steps_per_epoch: 0  # Derive steps_per_epoch from len(train_loader)
+amp: true
+grad_clip: 1.0
+
+# QM-specific: Velocity and force matching
+lambda_vel: 1.0  # Match MM importance
+lambda_com: 1.0e-1
+lambda_force: 0.5  # Higher initial force supervision for from-scratch training
+
+# Structural regularization with curriculum (start low, ramp up)
+lambda_struct_bond: 0.05    # Will ramp to 0.2 over curriculum
+lambda_struct_angle: 0.02   # Will ramp to 0.1 over curriculum
+lambda_struct_dihedral: 0.005  # Will ramp to 0.02 over curriculum
+
+val_every_steps: 3000  # More frequent validation early on to catch instabilities
+checkpoint_every_steps: 500  # Frequent checkpoints for analysis
+checkpoint_dir: outputs/checkpoints_qm_scratch
+log_dir: outputs/logs_qm_scratch
+resume: null
+
+wandb:
+  enabled: true
+  project: md-kstep
+  entity: dcerrone-dexterity3d
+  run_name: null
+
+# Data augmentation
+random_rotate: true
+random_rotate_mode: batch  # Less aggressive augmentation with large dataset
+
+struct_max_bonds: 256
+struct_max_angles: 256
+struct_max_dihedrals: 256
+max_val_batches: 100  # Limit validation to 100 batches (~25K samples) for speed
+
+# Gradually ramp up structural penalties over initial epochs
+curriculum_struct_epochs: 5  # Must be <= max_epochs for curriculum to complete

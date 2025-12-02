@@ -1,0 +1,28 @@
+arch: transformer_egnn
+hidden_dim: 256
+num_layers: 8
+cutoff_nm: 0.7  # QM typically uses smaller cutoffs
+activation: silu
+predict_delta: true
+
+# QM-specific: Tighter displacement bounds (QM is more rigid than MM)
+max_disp_nm: 0.01  # Was 0.25 in MM (25x reduction for k=4 QM)
+max_dvel_nm_per_ps: 2.0  # Was 6.0 in MM (3x reduction)
+
+# Use force head for QM (forces are well-defined and important)
+use_force_head: true
+force_head_weight: 0.05
+
+dropout: 0.1
+embedding_dim: 96
+layer_norm: true
+
+# Transformer-specific parameters
+attention_heads: 8
+use_edge_attention: true
+attention_dropout: 0.1
+positional_encoding: learned
+feedforward_dim: 1024
+attention_type: multi_head
+use_cross_attention: true
+

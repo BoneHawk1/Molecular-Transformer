@@ -1,0 +1,46 @@
+[INFO] Found 22 molecules in data/qm_molecules.smi
+[INFO] Running 22 molecules with 11 workers (1 threads per worker)
+[DEBUG Worker 38205] Thread limits set: OMP=1
+[DEBUG Worker 38206] Thread limits set: OMP=1
+[DEBUG Worker 38204] Thread limits set: OMP=1
+[DEBUG Worker 38207] Thread limits set: OMP=1
+[DEBUG Worker 38208] Thread limits set: OMP=1
+[DEBUG Worker 38209] Thread limits set: OMP=1
+[DEBUG Worker 38210] Thread limits set: OMP=1
+[DEBUG Worker 38211] Thread limits set: OMP=1
+[DEBUG Worker 38212] Thread limits set: OMP=1
+[DEBUG Worker 38213] Thread limits set: OMP=1
+[DEBUG Worker 38214] Thread limits set: OMP=1
+[INFO] Setting up QM trajectory for pyridine (SMILES: C1=CC=NC=C1)
+[INFO] Setting up QM trajectory for adenine (SMILES: C1=NC(=NC2=C1N=CN2)N)
+[INFO] Setting up QM trajectory for imidazole (SMILES: C1=CNC=N1)
+[INFO] Setting up QM trajectory for thymine (SMILES: CC1=CNC(=O)NC1=O)
+[INFO] Setting up QM trajectory for indole (SMILES: C1=CC=C2C(=C1)C=CN2)
+[INFO] Setting up QM trajectory for alanine (SMILES: CC(C(=O)O)N)
+[INFO] Setting up QM trajectory for valine (SMILES: CC(C)C(C(=O)O)N)
+[INFO] Setting up QM trajectory for imidazole_deriv (SMILES: C1=CN(C=NC1=N)C)
+[INFO] Setting up QM trajectory for serine (SMILES: C(C(C(=O)O)N)O)
+[INFO] Setting up QM trajectory for N-methylalanine (SMILES: CC(C(=O)O)N(C)C)
+[INFO] Setting up QM trajectory for glycine (SMILES: C(C(=O)O)N)
+[INFO] Molecule has 9 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 16 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 15 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 11 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 19 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 13 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 19 atoms
+[INFO] Molecule has 15 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 10 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Molecule has 15 atoms
+[INFO] Molecule has 14 atoms
+[INFO] Equilibrating for 20000 steps (5.0 ps)
+[INFO] Equilibrating for 20000 steps (5.0 ps)
