@@ -1,0 +1,19 @@
+{
+  "molecules": [
+    "c1ccccc1O",
+    "CC(=O)Oc1ccccc1C(=O)O",
+    "c1ccc(cc1)C(=O)N",
+    "COc1ccccc1",
+    "Cc1ccccc1",
+    "OC1CCCCC1",
+    "c1ccc2[nH]ccc2c1",
+    "Cc1ncc[nH]1",
+    "CCCCCO",
+    "CC(C)C(N)C(=O)O",
+    "OCc1ccccc1",
+    "OCCO",
+    "CC(=O)NC(C)C(=O)NC",
+    "Clc1ccccc1",
+    "C1CCOC1"
+  ]
+}

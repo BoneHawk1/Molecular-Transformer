@@ -1,0 +1,13 @@
+{
+  "molecules": [
+    "CC(C)NCCO",
+    "CN(C)C",
+    "CCCCO",
+    "C1CCCCC1",
+    "Cc1ccc(O)cc1",
+    "c1ccc2ccccc2c1",
+    "CC(C)CN",
+    "CN(C)C=O",
+    "CC(C)Cc1ccc(C(C)C(=O)O)cc1"
+  ]
+}
