@@ -20,6 +20,10 @@ try:
     from ase.md.langevin import Langevin
 except ImportError as e:
     raise ImportError("QM hybrid integrator requires: pip install ase; conda install -c conda-forge xtb") from e
+try:
+    from pyscf_gpu_calculator import PySCFGPUCalculator
+except Exception:
+    PySCFGPUCalculator = None
 
 from utils import configure_logging, ensure_dir, load_yaml, remove_com, set_seed, LOGGER
 
@@ -42,6 +46,13 @@ class QMConfig:
     method: str  # xTB method
     charge: int
     random_seed: int
+    basis: str = "sto-3g"
+    xc: str = "pbe"
+    spin: int = 0
+    use_gpu: bool = False
+    conv_tol: float = 1e-8
+    max_cycle: int = 100
+    backend: str = "xtb"
     nve_window_ps: float = 0.0
     nve_every_ps: float = 0.0
 
@@ -56,6 +67,13 @@ class QMConfig:
             method=cfg.get("method", "GFN2-xTB"),
             charge=cfg.get("charge", 0),
             random_seed=cfg.get("random_seed", 42),
+            basis=cfg.get("basis", "sto-3g"),
+            xc=cfg.get("xc", "pbe"),
+            spin=cfg.get("spin", 0),
+            use_gpu=cfg.get("use_gpu", False),
+            conv_tol=cfg.get("conv_tol", 1e-8),
+            max_cycle=cfg.get("max_cycle", 100),
+            backend=cfg.get("backend", cfg.get("qm_backend", "xtb")),
             nve_window_ps=cfg.get("nve_window_ps", 0.0),
             nve_every_ps=cfg.get("nve_every_ps", 0.0),
         )
@@ -92,21 +110,41 @@ def load_initial_state(qm_npz: Path, frame: int) -> Dict[str, np.ndarray]:
     }
 
 
+def _make_calculator(qm_cfg: QMConfig, backend: str):
+    """Build ASE calculator for the chosen QM backend."""
+    if backend == "pyscf":
+        if PySCFGPUCalculator is None:
+            raise ImportError("PySCF backend requested but PySCF is not available")
+        return PySCFGPUCalculator(
+            method=qm_cfg.method,
+            basis=qm_cfg.basis,
+            xc=qm_cfg.xc,
+            charge=qm_cfg.charge,
+            spin=qm_cfg.spin,
+            use_gpu=qm_cfg.use_gpu,
+            conv_tol=qm_cfg.conv_tol,
+            max_cycle=qm_cfg.max_cycle,
+        )
+    return XTB(method=qm_cfg.method, charge=qm_cfg.charge)
+
+
 def apply_qm_corrector(
     positions_nm: np.ndarray,
     velocities_nm_per_ps: np.ndarray,
     atomic_numbers: np.ndarray,
     qm_cfg: QMConfig,
     steps: int = 1,
+    backend: str = "xtb",
+    calc=None,
 ) -> Dict[str, np.ndarray]:
     """Apply xTB one-step corrector."""
     # Convert units: nm -> Angstrom, nm/ps -> Angstrom/fs
     positions_A = positions_nm * 10.0
     velocities_A_per_fs = velocities_nm_per_ps * 0.01
-    
+
     # Create ASE Atoms object
     atoms = Atoms(numbers=atomic_numbers, positions=positions_A)
-    atoms.calc = XTB(method=qm_cfg.method, charge=qm_cfg.charge)
+    atoms.calc = calc if calc is not None else _make_calculator(qm_cfg, backend)
     atoms.set_velocities(velocities_A_per_fs)
     
     # One corrector step using Velocity Verlet
@@ -146,13 +184,14 @@ def _run_nve_window(
     atomic_numbers: np.ndarray,
     qm_cfg: QMConfig,
     steps: int,
+    backend: str = "xtb",
 ) -> Dict[str, np.ndarray]:
     """Run NVE window for energy conservation analysis."""
     positions_A = positions_nm * 10.0
     velocities_A_per_fs = velocities_nm_per_ps * 0.01
     
     atoms = Atoms(numbers=atomic_numbers, positions=positions_A)
-    atoms.calc = XTB(method=qm_cfg.method, charge=qm_cfg.charge)
+    atoms.calc = _make_calculator(qm_cfg, backend)
     atoms.set_velocities(velocities_A_per_fs)
     
     dyn = VelocityVerlet(atoms, timestep=qm_cfg.dt_fs * units.fs)
@@ -214,8 +253,10 @@ def run_hybrid_qm(
     pos_threshold: float,
     vel_threshold: float,
     energy_rescale: bool = False,
+    backend: str = "xtb",
+    corrector_steps: int = 1,
 ) -> Dict[str, np.ndarray]:
-    """Run hybrid QM integration: k-step ML jump + xTB corrector."""
+    """Run hybrid QM integration: k-step ML jump + QM corrector (xTB or PySCF)."""
     
     # Load initial state
     state = load_initial_state(qm_npz, frame)
@@ -247,7 +288,7 @@ def run_hybrid_qm(
     # Initial energy
     try:
         atoms_init = Atoms(numbers=atomic_numbers, positions=positions_np * 10.0)
-        atoms_init.calc = XTB(method=qm_cfg.method, charge=qm_cfg.charge)
+        atoms_init.calc = _make_calculator(qm_cfg, backend)
         atoms_init.set_velocities(velocities_np * 0.01)
         trajectory_Ekin[0] = atoms_init.get_kinetic_energy() * 96.4853
         trajectory_Epot[0] = atoms_init.get_potential_energy() * 96.4853
@@ -257,7 +298,10 @@ def run_hybrid_qm(
     
     force_calls = 0
     failed_steps = 0
-    
+
+    # Create calculator once and reuse (major speedup for xTB)
+    shared_calc = _make_calculator(qm_cfg, backend)
+
     LOGGER.info("Running hybrid QM integration: %d steps, k=%d", steps, k_steps)
     start_time = time.time()
     
@@ -296,15 +340,17 @@ def run_hybrid_qm(
             scaled_pos = current_pos_np + delta_pos_np * scale
             scaled_vel = current_vel_np + delta_vel_np * scale
             
-            # Apply xTB corrector
+            # Apply QM corrector
             corr = apply_qm_corrector(
                 scaled_pos,
                 scaled_vel,
                 atomic_numbers,
                 qm_cfg,
-                steps=1,
+                steps=corrector_steps,
+                backend=backend,
+                calc=shared_calc,
             )
-            force_calls += 1
+            force_calls += corrector_steps
             
             # Center COM
             centered_pos_tmp, centered_vel_tmp = remove_com(
@@ -401,10 +447,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-attempts", type=int, default=5, help="Max retry attempts per step")
     parser.add_argument("--pos-threshold", type=float, default=1.0, help="Max position magnitude (nm)")
     parser.add_argument("--vel-threshold", type=float, default=50.0, help="Max velocity magnitude (nm/ps)")
+    parser.add_argument("--corrector-steps", type=int, default=1, help="Number of QM corrector steps per hybrid step")
     parser.add_argument(
         "--energy-rescale",
         action="store_true",
         help="Rescale velocities after each corrector step to conserve total energy",
+    )
+    parser.add_argument(
+        "--qm-backend",
+        choices=["xtb", "pyscf"],
+        default="xtb",
+        help="QM backend for the corrector (xtb or pyscf)",
     )
     return parser
 
@@ -440,6 +493,8 @@ def main() -> None:
         pos_threshold=args.pos_threshold,
         vel_threshold=args.vel_threshold,
         energy_rescale=args.energy_rescale,
+        backend=args.qm_backend,
+        corrector_steps=args.corrector_steps,
     )
     
     # Save trajectory
@@ -455,6 +510,7 @@ def main() -> None:
     metadata["k_steps"] = args.k_steps
     metadata["force_calls"] = int(result["force_calls"])
     metadata["failed_steps"] = int(result["failed_steps"])
+    metadata["qm_backend"] = args.qm_backend
     
     np.savez(
         args.out,
