@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -11,6 +12,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+from kstep.common import load_trajectory as _load_trajectory
 from utils import configure_logging, ensure_dir, LOGGER
 
 
@@ -24,20 +26,13 @@ def _json_default(obj):
 
 
 def load_trajectory(path: Path) -> Dict:
-    """Load trajectory from npz file."""
-    data = np.load(path, allow_pickle=True)
-    metadata = json.loads(str(data["metadata"])) if "metadata" in data else {}
-    return {
-        "pos": data["pos"],
-        "vel": data["vel"],
-        "Ekin": data["Ekin"],
-        "Epot": data["Epot"],
-        "Etot": data["Etot"] if "Etot" in data else data["Ekin"] + data["Epot"],
-        "time_ps": data["time_ps"] if "time_ps" in data else None,
-        "masses": data["masses"] if "masses" in data else None,
-        "atom_types": data["atom_types"] if "atom_types" in data else None,
-        "metadata": metadata,
-    }
+    """Load a trajectory (legacy QM velocities are rescaled to nm/ps on load)."""
+    data = _load_trajectory(path)
+    if "Etot" not in data:
+        data["Etot"] = data["Ekin"] + data["Epot"]
+    for key in ("time_ps", "masses", "atom_types"):
+        data.setdefault(key, None)
+    return data
 
 
 def compute_energy_drift(energies: np.ndarray, time_ps: np.ndarray) -> Dict[str, float]:
@@ -328,7 +323,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline", type=Path, required=True, help="Baseline QM trajectory directory")
     parser.add_argument("--hybrid", type=Path, required=True, help="Hybrid QM trajectory directory")
     parser.add_argument("--out-dir", type=Path, required=True, help="Output directory for metrics and plots")
-    parser.add_argument("--pattern", type=str, default="*_hybrid_k*.npz", help="Hybrid file pattern")
+    parser.add_argument("--pattern", type=str, default="*_hybrid*.npz", help="Hybrid file pattern")
     parser.add_argument("--root", type=Path, default=Path("."), help="Project root (for qm_splits discovery)")
     return parser
 
@@ -350,7 +345,7 @@ def main() -> None:
     
     for hybrid_path in hybrid_files:
         # Extract molecule name from filename
-        name = hybrid_path.stem.replace("_hybrid_k4", "").replace("_hybrid_k8", "").replace("_hybrid_k12", "")
+        name = re.sub(r"_hybrid(_k\d+)?$", "", hybrid_path.stem)
         
         # Find corresponding baseline
         baseline_path = args.baseline / name / "trajectory.npz"

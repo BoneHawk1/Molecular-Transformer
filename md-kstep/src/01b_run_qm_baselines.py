@@ -16,6 +16,7 @@ import numpy as np
 # Import only non-threaded libraries at module level.
 # ASE/xTB/RDKit imports MUST be deferred to run_qm() so worker_init
 # can set OMP_NUM_THREADS in each worker before those libraries load.
+from kstep.common import ase_velocity_to_nm_per_ps, friction_per_ps_to_ase
 from utils import configure_logging, ensure_dir, load_yaml, set_seed, compute_time_grid, LOGGER
 
 
@@ -93,7 +94,7 @@ def _get_masses_ase(atoms) -> np.ndarray:
 def _collect_frame_ase(atoms) -> Dict[str, np.ndarray]:
     """Collect state from ASE Atoms object."""
     positions = atoms.get_positions() / 10.0  # Angstrom -> nm
-    velocities = atoms.get_velocities() * 100.0  # Angstrom/fs -> nm/ps
+    velocities = ase_velocity_to_nm_per_ps(atoms.get_velocities())  # ASE units -> nm/ps
     
     try:
         potential = atoms.get_potential_energy() * 96.4853  # eV -> kJ/mol
@@ -204,7 +205,7 @@ def run_qm(smiles: str, name: str, out_dir: Path, config: QMConfig) -> Path:
             atoms,
             timestep=config.dt_fs * units.fs,
             temperature_K=config.temperature_K,
-            friction=config.friction_per_ps / (1000.0 / units.fs),  # Convert to ASE units
+            friction=friction_per_ps_to_ase(config.friction_per_ps),  # Convert to ASE units
         )
         
         try:
@@ -233,7 +234,7 @@ def run_qm(smiles: str, name: str, out_dir: Path, config: QMConfig) -> Path:
         atoms,
         timestep=config.dt_fs * units.fs,
         temperature_K=config.temperature_K,
-        friction=config.friction_per_ps / (1000.0 / units.fs),
+        friction=friction_per_ps_to_ase(config.friction_per_ps),
     )
 
     # Observer closure to collect data efficiently during MD run
@@ -320,6 +321,7 @@ def run_qm(smiles: str, name: str, out_dir: Path, config: QMConfig) -> Path:
         "config": config.__dict__,
         "num_atoms": int(n_atoms),
         "qm_method": config.method,
+        "velocity_units": "nm/ps",  # ASE units converted correctly (Oct 2026 fix)
     }
 
     out_dir = out_dir / name

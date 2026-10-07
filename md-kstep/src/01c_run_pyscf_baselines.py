@@ -18,6 +18,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 from pyscf_gpu_calculator import PySCFGPUCalculator
+from kstep.common import ase_velocity_to_nm_per_ps, friction_per_ps_to_ase
 from utils import (
     LOGGER,
     compute_time_grid,
@@ -99,7 +100,7 @@ def _smiles_to_atoms(smiles: str, charge: int = 0) -> Atoms:
 
 def _collect_frame_ase(atoms: Atoms) -> Dict[str, np.ndarray]:
     positions = atoms.get_positions() / 10.0  # Angstrom -> nm
-    velocities = atoms.get_velocities() * 100.0  # Angstrom/fs -> nm/ps
+    velocities = ase_velocity_to_nm_per_ps(atoms.get_velocities())  # ASE units -> nm/ps
 
     try:
         potential = atoms.get_potential_energy() * 96.4853  # eV -> kJ/mol
@@ -218,7 +219,7 @@ def run_pyscf(smiles: str, name: str, out_dir: Path, config: PySCFConfig) -> Pat
             atoms,
             timestep=config.dt_fs * units.fs,
             temperature_K=config.temperature_K,
-            friction=config.friction_per_ps / (1000.0 / units.fs),
+            friction=friction_per_ps_to_ase(config.friction_per_ps),
         )
         try:
             dyn_eq.run(eq_steps)
@@ -248,7 +249,7 @@ def run_pyscf(smiles: str, name: str, out_dir: Path, config: PySCFConfig) -> Pat
         atoms,
         timestep=config.dt_fs * units.fs,
         temperature_K=config.temperature_K,
-        friction=config.friction_per_ps / (1000.0 / units.fs),
+        friction=friction_per_ps_to_ase(config.friction_per_ps),
     )
 
     save_idx = 0
@@ -289,7 +290,7 @@ def run_pyscf(smiles: str, name: str, out_dir: Path, config: PySCFConfig) -> Pat
                     atoms,
                     timestep=config.dt_fs * units.fs,
                     temperature_K=config.temperature_K,
-                    friction=config.friction_per_ps / (1000.0 / units.fs),
+                    friction=friction_per_ps_to_ase(config.friction_per_ps),
                 )
 
             save_idx += 1
@@ -317,6 +318,7 @@ def run_pyscf(smiles: str, name: str, out_dir: Path, config: PySCFConfig) -> Pat
         "config": config.__dict__,
         "num_atoms": int(n_atoms),
         "method": config.method,
+        "velocity_units": "nm/ps",  # ASE units converted correctly (Oct 2026 fix)
         "basis": config.basis,
         "xc": config.xc,
         "gpu_enabled": bool(config.use_gpu),

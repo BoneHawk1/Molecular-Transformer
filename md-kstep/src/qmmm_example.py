@@ -25,6 +25,7 @@ try:
 except ImportError as e:
     raise ImportError("QM/MM integration requires ASE: pip install ase") from e
 
+from kstep.common import ase_velocity_to_nm_per_ps, friction_per_ps_to_ase, nm_per_ps_to_ase_velocity
 from utils import configure_logging, ensure_dir, load_yaml, remove_com, LOGGER
 
 # Import model builder
@@ -66,7 +67,7 @@ class HybridQMMMIntegrator:
             k_steps: Number of micro-steps per ML jump
             dt_fs: Base timestep (femtoseconds)
             temperature_K: Temperature (Kelvin)
-            friction: Langevin friction (1/fs)
+            friction: Langevin friction (1/ps)
             device: PyTorch device
         """
         self.atoms = atoms
@@ -93,7 +94,7 @@ class HybridQMMMIntegrator:
             atoms,
             timestep=dt_fs * units.fs,
             temperature_K=temperature_K,
-            friction=friction / (1000.0 / units.fs),
+            friction=friction_per_ps_to_ase(friction),
         )
         
         self.step_count = 0
@@ -101,7 +102,7 @@ class HybridQMMMIntegrator:
     def get_qm_state(self) -> Dict[str, np.ndarray]:
         """Extract QM region state."""
         positions = self.atoms.get_positions()[self.qm_indices] / 10.0  # Angstrom -> nm
-        velocities = self.atoms.get_velocities()[self.qm_indices] * 100.0  # Angstrom/fs -> nm/ps
+        velocities = ase_velocity_to_nm_per_ps(self.atoms.get_velocities()[self.qm_indices])  # ASE units -> nm/ps
         masses = self.atoms.get_masses()[self.qm_indices]
         atomic_numbers = self.atoms.get_atomic_numbers()[self.qm_indices]
         
@@ -116,14 +117,14 @@ class HybridQMMMIntegrator:
         """Update QM region state."""
         # Convert units
         positions_A = positions_nm * 10.0
-        velocities_A_per_fs = velocities_nm_per_ps * 0.01
+        velocities_ase = nm_per_ps_to_ase_velocity(velocities_nm_per_ps)
         
         # Update atoms
         full_pos = self.atoms.get_positions()
         full_vel = self.atoms.get_velocities()
         
         full_pos[self.qm_indices] = positions_A
-        full_vel[self.qm_indices] = velocities_A_per_fs
+        full_vel[self.qm_indices] = velocities_ase
         
         self.atoms.set_positions(full_pos)
         self.atoms.set_velocities(full_vel)
