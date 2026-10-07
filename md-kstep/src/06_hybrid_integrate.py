@@ -64,11 +64,16 @@ def main() -> None:
     p.add_argument("--delta-scale", type=float, default=1.0)
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--max-bond-strain", type=float, default=0.25)
+    p.add_argument("--max-epot-rise-kt", type=float, default=25.0,
+                   help="Reject learned steps whose potential energy rises > this many kT above the start (0 = off)")
     p.add_argument("--max-delta-pos", type=float, default=0.0, help="Hard cap on |Δx| (nm); legacy runs used 0.2")
     p.add_argument("--max-delta-vel", type=float, default=0.0, help="Hard cap on |Δv| (nm/ps); legacy runs used 4.5")
     p.add_argument("--uq-samples", type=int, default=1, help="Flow samples per step for the uncertainty estimate")
     p.add_argument("--uq-threshold", type=float, default=float("inf"), help="Escalate when Δx spread (nm) exceeds this")
     p.add_argument("--flow-steps", type=int, default=None, help="Override ODE steps of the flow sampler")
+    p.add_argument("--energy-rescale", action="store_true", help="Hold total energy at its initial value (NVE-style)")
+    p.add_argument("--thermostat", choices=["csvr", "none"], default="csvr",
+                   help="Resample kinetic energy canonically after each learned jump (default; reference is Langevin)")
     p.add_argument("--platform", default=None, help="Override OpenMM platform")
     p.add_argument("--no-cuda-graph", action="store_true")
     p.add_argument("--device", default="cuda")
@@ -107,6 +112,12 @@ def main() -> None:
         uq_threshold=args.uq_threshold,
         sampler_kwargs=sampler_kwargs,
         log_every=max(args.steps // 10, 1),
+        energy_rescale=args.energy_rescale,
+        precheck_h_bonds=corrector.sim.system.getNumConstraints() == 0,
+        thermostat_K=float(md_cfg.get("temperature_K", 300.0)) if args.thermostat == "csvr" else 0.0,
+        seed=args.seed,
+        max_epot_rise_kT=args.max_epot_rise_kt,
+        temperature_K=float(md_cfg.get("temperature_K", 300.0)),
     )
     LOGGER.info("%s | k=%d (%.3f ps jump) + %d corrector steps | %d macro-steps", info["predictor"], k,
                 jump_time_ps, corrector_steps, args.steps)

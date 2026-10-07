@@ -7,8 +7,9 @@
 #       scripts/run_hybrid_suite.sh zero_k4 --predictor zero --k-steps 4
 #
 # Env: OUT_ROOT (default outputs/v2/hybrid), STEPS (2500 macro-steps), MD_CONFIG, FRAME.
-# Existing outputs are skipped, so the script can be re-run after an interruption.
-set -euo pipefail
+# Existing outputs are skipped, so the script can be re-run after an interruption; a failing
+# molecule is reported and the loop continues.
+set -uo pipefail
 LABEL=$1; shift
 OUT="${OUT_ROOT:-outputs/v2/hybrid}/$LABEL"
 mkdir -p "$OUT"
@@ -17,5 +18,6 @@ for mol_dir in data/raw/*/; do
   [ -f "$OUT/$mol.npz" ] && continue
   python src/06_hybrid_integrate.py --md-config "${MD_CONFIG:-configs/md.yaml}" --molecule "$mol_dir" \
     --initial-md "data/md/$mol/trajectory.npz" --frame "${FRAME:-0}" --steps "${STEPS:-2500}" \
-    --out "$OUT/$mol.npz" "$@" 2>&1 | grep -v "^\[INFO\] macro-step"
+    --out "$OUT/$mol.npz" "$@" 2>&1 | grep -v "^\[INFO\] macro-step" || true
+  [ -f "$OUT/$mol.npz" ] || echo "FAILED: $LABEL $mol"
 done

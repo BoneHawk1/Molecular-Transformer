@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Protocol
 import numpy as np
 import torch
 
-from .common import LOGGER, remove_com
+from .common import KB_KJ_PER_MOL_K, LOGGER, kinetic_energy, remove_com
 from .geometry import bond_lengths, guess_bonds
 
 
@@ -135,12 +135,29 @@ class HybridOptions:
     delta_scale: float = 1.0
     max_attempts: int = 3
     max_bond_strain: float = 0.25     # reject if any bond changes length by more than this fraction
+    # When the corrector constrains X-H bond lengths (OpenMM HBonds) it fixes them anyway,
+    # so the pre-corrector check can ignore them; the post-corrector check uses all bonds.
+    precheck_h_bonds: bool = True
     max_delta_pos: float = 0.0        # optional hard cap on |Δx| per atom (nm), 0 = off
     max_delta_vel: float = 0.0        # optional hard cap on |Δv| per atom (nm/ps), 0 = off
     uq_samples: int = 1
     uq_threshold: float = math.inf    # nm; RMS per-atom spread of Δx across samples
     sampler_kwargs: Dict = field(default_factory=dict)
     log_every: int = 0
+    # Rescale velocities after every learned step so the total energy stays at its initial
+    # value. Use with energy-conserving (Verlet) correctors: there, small random errors in
+    # sampled Δv otherwise accumulate as heating because nothing dissipates them.
+    energy_rescale: bool = False
+    # Canonical (CSVR / Bussi, tau -> 0) kinetic-energy resampling after every learned step:
+    # keeps the predicted velocity *directions* but draws the kinetic energy from its
+    # canonical distribution at this temperature (K). Appropriate when the reference is
+    # Langevin/canonical dynamics; prevents sampling errors in Δv from heating the system.
+    thermostat_K: float = 0.0
+    seed: int = 0
+    # Reject a corrected learned step if its potential energy exceeds the initial value by
+    # more than this many kT. Catches non-bonded clashes the bond-strain check cannot see.
+    max_epot_rise_kT: float = 25.0
+    temperature_K: float = 300.0
 
 
 def _cap(delta: torch.Tensor, limit: float) -> torch.Tensor:
@@ -204,14 +221,30 @@ def run_hybrid(
     overhead = int(getattr(corrector, "extra_force_calls_per_run", 0))
     n_done = n_macro
 
-    def acceptable(p: np.ndarray, v: np.ndarray) -> bool:
+    heavy_bond = ~((z[bonds[:, 0]] == 1) | (z[bonds[:, 1]] == 1)) if len(bonds) else np.zeros(0, bool)
+    pre_mask = np.ones(len(bonds), bool) if opts.precheck_h_bonds else heavy_bond
+
+    def acceptable(p: np.ndarray, v: np.ndarray, mask: Optional[np.ndarray] = None) -> bool:
         if not (np.all(np.isfinite(p)) and np.all(np.isfinite(v))):
             return False
-        if len(bonds) and opts.max_bond_strain > 0:
-            strain = np.abs(bond_lengths(p, bonds) / ref_len - 1.0)
+        sel = bonds if mask is None else bonds[mask]
+        if len(sel) and opts.max_bond_strain > 0:
+            ref = ref_len if mask is None else ref_len[mask]
+            strain = np.abs(bond_lengths(p, sel) / ref - 1.0)
             if float(strain.max()) > opts.max_bond_strain:
                 return False
         return True
+
+    rng = np.random.default_rng(opts.seed)
+    e_target = None
+    epot_max = np.inf
+    if opts.energy_rescale or opts.max_epot_rise_kT > 0:
+        init = corrector.run(pos, vel, 0)
+        ekin[0], epot[0] = init.ekin, init.epot
+        if opts.energy_rescale:
+            e_target = init.ekin + init.epot
+        if opts.max_epot_rise_kT > 0 and np.isfinite(init.epot):
+            epot_max = init.epot + opts.max_epot_rise_kT * KB_KJ_PER_MOL_K * opts.temperature_K
 
     for step in range(n_macro):
         proposal = None
@@ -232,7 +265,7 @@ def run_hybrid(
                 break
             cand_p, cand_v = pos + scale * dx0, vel + scale * dv0
             attempt += 1
-            if acceptable(cand_p, cand_v):
+            if acceptable(cand_p, cand_v, pre_mask):
                 proposal = (cand_p, cand_v)
                 break
             if not stochastic:
@@ -244,7 +277,7 @@ def run_hybrid(
         if proposal is not None:
             result = corrector.run(proposal[0], proposal[1], opts.corrector_steps)
             force_calls += opts.corrector_steps + overhead
-            if not acceptable(result.positions, result.velocities):
+            if not acceptable(result.positions, result.velocities) or not (result.epot <= epot_max):
                 result = None
         if result is None:
             status[step] = 1 if (replicas > 1 and spread[step] > opts.uq_threshold) else 2
@@ -257,8 +290,23 @@ def run_hybrid(
         t_corr += time.perf_counter() - t0
 
         pos, vel = remove_com(np.asarray(result.positions, np.float64), np.asarray(result.velocities, np.float64), masses)
+        e_kin, e_pot = result.ekin, result.epot
+        if opts.thermostat_K > 0 and status[step] == 0:
+            ke_now = float(kinetic_energy(vel, masses))
+            dof = 3 * len(z) - 3
+            kt = KB_KJ_PER_MOL_K * opts.thermostat_K
+            ke_new = rng.gamma(dof / 2.0, kt)
+            if ke_now > 0:
+                vel = vel * np.sqrt(ke_new / ke_now)
+                e_kin = ke_new
+        if e_target is not None and status[step] == 0 and np.isfinite(e_pot):
+            ke_now = float(kinetic_energy(vel, masses))
+            if ke_now > 0 and e_target - e_pot > 0:
+                factor = np.sqrt((e_target - e_pot) / ke_now)
+                vel = vel * factor
+                e_kin = ke_now * factor ** 2
         out_pos[step + 1], out_vel[step + 1] = pos, vel
-        ekin[step + 1], epot[step + 1] = result.ekin, result.epot
+        ekin[step + 1], epot[step + 1] = e_kin, e_pot
         if opts.log_every and (step + 1) % opts.log_every == 0:
             LOGGER.info("macro-step %d/%d | escalated %d | fallback %d", step + 1, n_macro,
                         int((status[:step + 1] == 1).sum()), int((status[:step + 1] == 2).sum()))
@@ -296,5 +344,8 @@ def run_hybrid(
             "corrector_time_s": t_corr,
             "stochastic_predictor": stochastic,
             "uq_samples": replicas,
+            "energy_rescale": bool(opts.energy_rescale),
+            "thermostat_K": float(opts.thermostat_K),
+            "max_epot_rise_kT": float(opts.max_epot_rise_kT),
         },
     }
