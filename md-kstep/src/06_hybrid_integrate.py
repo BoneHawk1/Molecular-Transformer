@@ -64,6 +64,8 @@ def main() -> None:
     p.add_argument("--delta-scale", type=float, default=1.0)
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--max-bond-strain", type=float, default=0.25)
+    p.add_argument("--quench-mode", choices=["full", "thermal"], default="full",
+                   help="'thermal' stops the quench at the equilibrium potential-energy level")
     p.add_argument("--quench-iterations", type=int, default=0,
                    help="Minimiser iterations relaxing bond/angle strain before the corrector steps")
     p.add_argument("--max-epot-sigma", type=float, default=8.0,
@@ -73,6 +75,9 @@ def main() -> None:
     p.add_argument("--uq-samples", type=int, default=1, help="Flow samples per step for the uncertainty estimate")
     p.add_argument("--uq-threshold", type=float, default=float("inf"), help="Escalate when Δx spread (nm) exceeds this")
     p.add_argument("--flow-steps", type=int, default=None, help="Override ODE steps of the flow sampler")
+    p.add_argument("--flow-solver", choices=["heun", "euler", "sde"], default=None, help="Override the flow sampler")
+    p.add_argument("--sde-eps", type=float, default=None, help="Noise level for --flow-solver sde")
+    p.add_argument("--sde-t-start", type=float, default=None, help="Flow time after which sde noise is injected")
     p.add_argument("--energy-rescale", action="store_true", help="Hold total energy at its initial value (NVE-style)")
     p.add_argument("--thermostat", choices=["csvr", "none"], default="csvr",
                    help="Resample kinetic energy canonically after each learned jump (default; reference is Langevin)")
@@ -102,6 +107,12 @@ def main() -> None:
     corrector = OpenMMCorrector(args.molecule, md_cfg, args.seed, args.platform)
     init = load_trajectory(args.initial_md)
     sampler_kwargs = {"steps": args.flow_steps} if args.flow_steps else {}
+    if args.flow_solver:
+        sampler_kwargs["solver"] = args.flow_solver
+    if args.sde_eps is not None:
+        sampler_kwargs["sde_eps"] = args.sde_eps
+    if args.sde_t_start is not None:
+        sampler_kwargs["sde_t_start"] = args.sde_t_start
     opts = HybridOptions(
         jump_time_ps=jump_time_ps,
         corrector_steps=corrector_steps,
@@ -120,6 +131,7 @@ def main() -> None:
         seed=args.seed,
         max_epot_sigma=args.max_epot_sigma,
         quench_iterations=args.quench_iterations,
+        quench_mode=args.quench_mode,
         temperature_K=float(md_cfg.get("temperature_K", 300.0)),
     )
     LOGGER.info("%s | k=%d (%.3f ps jump) + %d corrector steps | %d macro-steps", info["predictor"], k,

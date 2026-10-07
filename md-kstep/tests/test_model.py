@@ -112,3 +112,19 @@ def test_loss_backward(kind):
     loss.backward()
     assert torch.isfinite(loss)
     assert all(p.grad is not None for p in m.parameters() if p.requires_grad)
+
+
+def test_sde_sampler_is_equivariant_and_conserves_momentum():
+    m, b = _model("flow"), _double(_batch())
+    R = _orthogonal(5)
+    g = torch.Generator().manual_seed(0)
+    n0 = (torch.randn(b["x_t"].shape, generator=g, dtype=torch.float64), torch.randn(b["x_t"].shape, generator=g, dtype=torch.float64))
+    sn = (torch.randn((3,) + tuple(b["x_t"].shape), generator=g, dtype=torch.float64),
+          torch.randn((3,) + tuple(b["x_t"].shape), generator=g, dtype=torch.float64))
+    kw = dict(solver="sde", sde_eps=1.0, sde_t_start=0.0)
+    dx, dv = m.predict(b, noise=n0, step_noise=sn, **kw)
+    rb = dict(b, x_t=b["x_t"] @ R.T, v_t=b["v_t"] @ R.T)
+    rdx, rdv = m.predict(rb, noise=(n0[0] @ R.T, n0[1] @ R.T), step_noise=(sn[0] @ R.T, sn[1] @ R.T), **kw)
+    torch.testing.assert_close(rdx, dx @ R.T, rtol=1e-6, atol=1e-9)
+    per_graph = torch.zeros(2, 3, dtype=dx.dtype).index_add_(0, b["batch"], b["masses"].unsqueeze(-1) * dv)
+    assert per_graph.abs().max() < 1e-9

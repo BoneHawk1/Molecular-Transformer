@@ -93,6 +93,8 @@ class CudaGraphPredictor:
         if self.stochastic:
             static["nx"].normal_(generator=generator).mul_(noise_scale)
             static["nv"].normal_(generator=generator).mul_(noise_scale)
+            static["snx"].normal_(generator=generator)
+            static["snv"].normal_(generator=generator)
         graph.replay()
         return out[0].clone(), out[1].clone()
 
@@ -103,11 +105,15 @@ class CudaGraphPredictor:
         static["num_graphs"] = int(batch["num_graphs"])
         static["nx"] = torch.randn_like(static["x_t"])
         static["nv"] = torch.randn_like(static["v_t"])
+        n_steps = int(kwargs.get("steps") or getattr(self.cfg, "flow_steps", 1))
+        static["snx"] = torch.randn((n_steps,) + tuple(static["x_t"].shape), device=static["x_t"].device)
+        static["snv"] = torch.randn_like(static["snx"])
         edge_index = full_graph(static["batch"])
         noise = (static["nx"], static["nv"]) if self.stochastic else None
+        extra = {"step_noise": (static["snx"], static["snv"])} if self.stochastic else {}
 
         def run():
-            return self.model.predict(static, noise=noise, edge_index=edge_index, **kwargs)
+            return self.model.predict(static, noise=noise, edge_index=edge_index, **extra, **kwargs)
 
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
@@ -163,6 +169,10 @@ class HybridOptions:
     # iterations before the corrector steps (needs a corrector with ``quench``). Over a
     # k-step jump the fast modes have fully decorrelated; the model's job is the slow ones.
     quench_iterations: int = 0
+    # "full": always run quench_iterations. "thermal": stop once the potential energy is back
+    # to the thermal level E_min + (dof/2)·kT, where E_min is the minimised energy of the
+    # starting structure – keeps the bond/angle fluctuations instead of freezing them out.
+    quench_mode: str = "full"
     temperature_K: float = 300.0
 
 
@@ -230,16 +240,26 @@ def run_hybrid(
     heavy_bond = ~((z[bonds[:, 0]] == 1) | (z[bonds[:, 1]] == 1)) if len(bonds) else np.zeros(0, bool)
     pre_mask = np.ones(len(bonds), bool) if opts.precheck_h_bonds else heavy_bond
 
-    def acceptable(p: np.ndarray, v: np.ndarray, mask: Optional[np.ndarray] = None) -> bool:
+    reasons: Dict[str, int] = {}
+    worst_bonds: Dict[str, int] = {}
+
+    def rejection(p: np.ndarray, v: np.ndarray, mask: Optional[np.ndarray] = None, tag: str = "pre") -> Optional[str]:
+        """None if the state passes the checks, else a short reason (also tallied)."""
+        reason = None
         if not (np.all(np.isfinite(p)) and np.all(np.isfinite(v))):
-            return False
-        sel = bonds if mask is None else bonds[mask]
-        if len(sel) and opts.max_bond_strain > 0:
-            ref = ref_len if mask is None else ref_len[mask]
-            strain = np.abs(bond_lengths(p, sel) / ref - 1.0)
-            if float(strain.max()) > opts.max_bond_strain:
-                return False
-        return True
+            reason = f"{tag}_nonfinite"
+        else:
+            idx = np.arange(len(bonds)) if mask is None else np.nonzero(mask)[0]
+            if len(idx) and opts.max_bond_strain > 0:
+                strain = np.abs(bond_lengths(p, bonds[idx]) / ref_len[idx] - 1.0)
+                if float(strain.max()) > opts.max_bond_strain:
+                    reason = f"{tag}_bond_strain"
+                    i, j = bonds[idx[int(np.argmax(strain))]]
+                    key = f"{i}-{j}"
+                    worst_bonds[key] = worst_bonds.get(key, 0) + 1
+        if reason:
+            reasons[reason] = reasons.get(reason, 0) + 1
+        return reason
 
     rng = np.random.default_rng(opts.seed)
     e_target = None
@@ -253,6 +273,13 @@ def run_hybrid(
             half_dof = (3 * len(z) - 6) / 2.0
             kt = KB_KJ_PER_MOL_K * opts.temperature_K
             epot_max = init.epot + (half_dof + opts.max_epot_sigma * np.sqrt(half_dof)) * kt
+
+    quench_target = None
+    if opts.quench_iterations > 0 and opts.quench_mode == "thermal":
+        min_pos, n_eval = corrector.quench(pos, 500)
+        force_calls += n_eval
+        half_dof = (3 * len(z) - 6) / 2.0
+        quench_target = corrector.energy(min_pos) + half_dof * KB_KJ_PER_MOL_K * opts.temperature_K
 
     for step in range(n_macro):
         proposal = None
@@ -270,10 +297,11 @@ def run_hybrid(
             dv0 = dv[0].double().cpu().numpy()
             t_model += time.perf_counter() - t0
             if replicas > 1 and spread[step] > opts.uq_threshold:
+                reasons["uq"] = reasons.get("uq", 0) + 1
                 break
             cand_p, cand_v = pos + scale * dx0, vel + scale * dv0
             attempt += 1
-            if acceptable(cand_p, cand_v, pre_mask):
+            if rejection(cand_p, cand_v, pre_mask, "pre") is None:
                 proposal = (cand_p, cand_v)
                 break
             if not stochastic:
@@ -285,11 +313,17 @@ def run_hybrid(
         if proposal is not None:
             prop_pos = proposal[0]
             if opts.quench_iterations > 0:
-                prop_pos, n_eval = corrector.quench(prop_pos, opts.quench_iterations)
+                if quench_target is None:
+                    prop_pos, n_eval = corrector.quench(prop_pos, opts.quench_iterations)
+                else:
+                    prop_pos, n_eval = corrector.quench(prop_pos, opts.quench_iterations, target_epot=quench_target)
                 force_calls += n_eval
             result = corrector.run(prop_pos, proposal[1], opts.corrector_steps)
             force_calls += opts.corrector_steps + overhead
-            if not acceptable(result.positions, result.velocities) or not (result.epot <= epot_max):
+            if rejection(result.positions, result.velocities, None, "post") is not None:
+                result = None
+            elif not (result.epot <= epot_max):
+                reasons["post_epot"] = reasons.get("post_epot", 0) + 1
                 result = None
         if result is None:
             status[step] = 1 if (replicas > 1 and spread[step] > opts.uq_threshold) else 2
@@ -360,5 +394,8 @@ def run_hybrid(
             "thermostat_K": float(opts.thermostat_K),
             "max_epot_sigma": float(opts.max_epot_sigma),
             "quench_iterations": int(opts.quench_iterations),
+            "quench_mode": opts.quench_mode,
+            "rejection_reasons": dict(reasons),
+            "worst_bonds": dict(sorted(worst_bonds.items(), key=lambda kv: -kv[1])[:5]),
         },
     }

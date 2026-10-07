@@ -47,7 +47,9 @@ class ModelConfig:
     msg_norm: float = 8.0         # divides summed messages (≈ typical neighbour count)
     time_embed_dim: int = 32      # flow only
     flow_steps: int = 8           # default ODE steps at sampling time
-    flow_solver: str = "heun"     # "euler" | "heun"
+    flow_solver: str = "heun"     # "euler" | "heun" | "sde" (Euler–Maruyama with late noise injection)
+    sde_eps: float = 0.0          # sde: noise level ε in g(t)^2 = ε (1 - t) for t >= sde_t_start
+    sde_t_start: float = 0.5      # sde: inject noise only in the later part of the flow
     max_disp_nm: float = 0.0      # optional equivariant soft clamp on |Δx| per atom (0 = off)
     max_dvel_nm_per_ps: float = 0.0
 
@@ -328,11 +330,23 @@ class KStepModel(nn.Module):
         noise_scale: float = 1.0,
         noise: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         edge_index: Optional[torch.Tensor] = None,
+        sde_eps: Optional[float] = None,
+        sde_t_start: Optional[float] = None,
+        step_noise: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (Δx, Δv) in physical units. Stochastic for ``kind == 'flow'``.
 
         ``noise`` optionally supplies the normalised starting noise (yx, yv) of the flow;
         ``edge_index`` a precomputed :func:`full_graph` (both needed for CUDA-graph capture).
+
+        ``solver='sde'`` integrates the reverse SDE that shares the flow's marginals. For the
+        linear path y_t = (1-t) y0 + t y1 with Gaussian y0, the score follows from the learned
+        velocity: ∇log p_t(y) = -(y - t·u)/(1-t). With diffusion g(t)^2 = ε (1-t) for
+        t >= t_start (0 before), the SDE is
+            dy = [u - ½ ε (y - t·u)] dt + sqrt(ε (1-t)) dW,
+        i.e. a Langevin-style corrector that re-injects noise late in sampling and lets the
+        drift pull samples back toward high-density regions (``step_noise`` supplies
+        the per-step Gaussian draws, for CUDA graphs).
         """
         z = batch["atom_types"]
         G = self._num_graphs(batch)
@@ -361,10 +375,26 @@ class KStepModel(nn.Module):
             return self._project(ux, uv, batch, sx, sv, G)
 
         dt = 1.0 / steps
+        eps = float(self.cfg.sde_eps if sde_eps is None else sde_eps)
+        t_start = float(self.cfg.sde_t_start if sde_t_start is None else sde_t_start)
         for k in range(steps):
             t0 = k * dt
             ux, uv = field(yx, yv, t0)
-            if solver == "heun":
+            if solver == "sde":
+                w = eps if t0 >= t_start else 0.0
+                yx = yx + dt * (ux - 0.5 * w * (yx - t0 * ux))
+                yv = yv + dt * (uv - 0.5 * w * (yv - t0 * uv))
+                if w > 0:
+                    if step_noise is not None:
+                        nx, nv = step_noise[0][k], step_noise[1][k]
+                    else:
+                        nx = torch.randn(shape, device=sx.device, dtype=sx.dtype, generator=generator)
+                        nv = torch.randn(shape, device=sx.device, dtype=sx.dtype, generator=generator)
+                    nx, nv = self._project(nx, nv, batch, sx, sv, G)
+                    amp = math.sqrt(w * (1.0 - t0) * dt)
+                    yx = yx + amp * nx
+                    yv = yv + amp * nv
+            elif solver == "heun":
                 ex, ev = yx + dt * ux, yv + dt * uv
                 ux2, uv2 = field(ex, ev, t0 + dt)
                 yx = yx + 0.5 * dt * (ux + ux2)

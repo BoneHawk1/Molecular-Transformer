@@ -23,7 +23,10 @@ def _embed_molecule(smiles: str, embed_seed: int, max_attempts: int) -> Chem.Mol
     rdmol = Chem.AddHs(rdmol)
     params = AllChem.ETKDGv3()
     params.randomSeed = embed_seed
-    params.maxAttempts = max_attempts
+    if hasattr(params, "maxIterations"):  # RDKit >= 2024 renamed maxAttempts
+        params.maxIterations = max_attempts
+    else:
+        params.maxAttempts = max_attempts
     if AllChem.EmbedMolecule(rdmol, params) != 0:
         raise RuntimeError(f"Embedding failed for {smiles}")
     if AllChem.MMFFOptimizeMolecule(rdmol, maxIters=1024) != 0:
@@ -75,6 +78,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--force-field", default="openff_unconstrained-2.2.1.offxml", help="OpenFF force field")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--max-attempts", type=int, default=200, help="Max embedding attempts per molecule")
+    parser.add_argument("--overwrite", action="store_true", help="Re-create molecules that already exist")
     return parser
 
 
@@ -91,25 +95,33 @@ def main() -> None:
     force_field = ForceField(args.force_field)
     ensure_dir(args.out_dir)
 
-    summary = {}
-    for idx, smiles in enumerate(smiles_list):
-        LOGGER.info("[%d/%d] Processing %s", idx + 1, len(smiles_list), smiles)
-        rdmol = _embed_molecule(smiles, args.seed + idx, args.max_attempts)
-        off_mol = Molecule.from_rdkit(rdmol, allow_undefined_stereo=True)
-        topology, system = _parameterize(off_mol, force_field)
-        positions, _ = _rdmol_to_openmm_positions(rdmol)
-        summary[smiles] = _write_outputs(smiles, args.out_dir, topology, system, positions)
-
-    metadata_path = args.out_dir / "metadata.json"
-    LOGGER.info("Writing metadata to %s", metadata_path)
     import json
 
-    metadata = {
-        "force_field": args.force_field,
-        "seed": args.seed,
-        "molecules": summary,
-    }
+    metadata_path = args.out_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+    summary = metadata.get("molecules", {})
+    failed = []
+    for idx, smiles in enumerate(smiles_list):
+        mol_dir = args.out_dir / smiles.replace("/", "_").replace("\\", "_").replace(" ", "")
+        if (mol_dir / "forcefield.xml").exists() and not args.overwrite:
+            LOGGER.info("[%d/%d] %s exists, skipping", idx + 1, len(smiles_list), smiles)
+            continue
+        LOGGER.info("[%d/%d] Processing %s", idx + 1, len(smiles_list), smiles)
+        try:
+            rdmol = _embed_molecule(smiles, args.seed + idx, args.max_attempts)
+            off_mol = Molecule.from_rdkit(rdmol, allow_undefined_stereo=True)
+            topology, system = _parameterize(off_mol, force_field)
+            positions, _ = _rdmol_to_openmm_positions(rdmol)
+            summary[smiles] = _write_outputs(smiles, args.out_dir, topology, system, positions)
+        except Exception as exc:  # keep going; report at the end
+            LOGGER.error("Failed for %s: %s", smiles, exc)
+            failed.append(smiles)
+
+    LOGGER.info("Writing metadata to %s", metadata_path)
+    metadata.update({"force_field": args.force_field, "seed": args.seed, "molecules": summary})
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    if failed:
+        LOGGER.warning("%d molecules failed: %s", len(failed), ", ".join(failed))
 
 
 if __name__ == "__main__":

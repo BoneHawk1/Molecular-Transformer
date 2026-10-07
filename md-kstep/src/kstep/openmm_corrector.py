@@ -42,15 +42,36 @@ class OpenMMCorrector:
             epot=state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole),
         )
 
-    def quench(self, positions_nm, iterations: int):
-        """A few L-BFGS iterations to relax bond/angle strain left by a learned jump.
+    def energy(self, positions_nm) -> float:
+        ctx = self.sim.context
+        ctx.setPositions(np.asarray(positions_nm) * unit.nanometer)
+        return ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
 
-        Returns (positions, force_evaluations). OpenMM does not report the exact number
-        of energy evaluations, so this counts 2 per iteration (an upper bound for L-BFGS
-        with its line search).
+    def quench(self, positions_nm, iterations: int, target_epot: float | None = None, chunk: int = 2):
+        """Relax bond/angle strain left by a learned jump with a few L-BFGS iterations.
+
+        With ``target_epot`` the minimiser runs in chunks of ``chunk`` iterations and stops
+        as soon as the potential energy is at or below the target (a *thermal* quench: it
+        removes excess strain without freezing out thermal bond/angle fluctuations).
+        Returns (positions, force_evaluations); OpenMM does not report exact evaluation
+        counts, so 2 per iteration (an upper bound for L-BFGS with line search) plus one per
+        energy check are counted.
         """
         ctx = self.sim.context
         ctx.setPositions(np.asarray(positions_nm) * unit.nanometer)
-        LocalEnergyMinimizer.minimize(ctx, 1.0, int(iterations))
+        evals = 0
+        if target_epot is None:
+            LocalEnergyMinimizer.minimize(ctx, 1.0, int(iterations))
+            evals = 2 * int(iterations)
+        else:
+            done = 0
+            while True:
+                e = ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                evals += 1
+                if e <= target_epot or done >= iterations:
+                    break
+                LocalEnergyMinimizer.minimize(ctx, 1.0, chunk)
+                done += chunk
+                evals += 2 * chunk
         pos = ctx.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-        return np.asarray(pos), 2 * int(iterations)
+        return np.asarray(pos), evals
