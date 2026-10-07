@@ -10,6 +10,21 @@ The project started as a CHEM 495 final project (Fall 2025; report in
 [`Research Report/`](Research%20Report/)). It was overhauled in October 2026; see
 [`docs/REVISIT_2026.md`](docs/REVISIT_2026.md) for what changed, why, and the new results.
 
+## Current status (Oct 2026)
+
+On 12 small molecules (classical MD, 300 K), the stochastic flow-matching model at
+k=8 (an 800 fs jump) reproduces MD's per-step motion and torsion-flip rates to within ~6 %.
+It does this with 8.4× fewer force evaluations and is about 2.2× faster in wall-clock time
+than plain OpenMM on an RTX 5070 Ti.
+
+* Torsion distributions are close to the seed-to-seed noise floor.
+* Bond and angle distributions are still too narrow, which is the main open problem.
+* A deterministic model of the same architecture, the corrector-only control and the 2025
+  Transformer-EGNN all under-move the molecule badly.
+* The QM (xTB, 10 fs jump) model is not accurate enough yet.
+
+Details, tables and plots: [`docs/REVISIT_2026.md`](docs/REVISIT_2026.md).
+
 ## What is in the box
 
 | Stage | Script | Notes |
@@ -45,7 +60,7 @@ python src/02_make_dataset.py --md-root data/md --out-root data/md --splits-dir 
 KIND=flow K=4 bash scripts/train.sh          # -> outputs/v2/flow_k4/best.pt
 KIND=mean K=4 bash scripts/train.sh          # deterministic comparison
 
-scripts/run_hybrid_suite.sh flow_k4 --checkpoint outputs/v2/flow_k4/best.pt
+scripts/run_hybrid_suite.sh flow_k4 --checkpoint outputs/v2/flow_k4/best.pt --quench-iterations 10
 scripts/run_hybrid_suite.sh zero_k4 --predictor zero --k-steps 4      # corrector-only control
 python src/05_evaluate.py --baseline data/md --reference2 data/md_seed2 --splits-dir data/splits \
     --hybrid zero=outputs/v2/hybrid/zero_k4 flow=outputs/v2/hybrid/flow_k4 --out-dir outputs/v2/eval

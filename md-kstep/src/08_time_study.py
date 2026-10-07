@@ -65,7 +65,10 @@ def main() -> None:
     p.add_argument("--condition", nargs="+", required=True,
                    help="label=spec; spec is 'zero', a v2 checkpoint, or legacy 'ckpt.pt:model.yaml'")
     p.add_argument("--flow-steps", type=int, default=None)
-    p.add_argument("--k-steps", type=int, default=4)
+    p.add_argument("--k-steps", type=int, default=4, help="Jump length for predictors without a stored k (zero)")
+    p.add_argument("--quench-iterations", type=int, default=10)
+    p.add_argument("--max-attempts", type=int, default=3)
+    p.add_argument("--no-thermostat", dest="thermostat", action="store_false")
     p.add_argument("--corrector-fraction", type=float, default=0.05)
     p.add_argument("--macro-steps", type=int, default=300)
     p.add_argument("--warmup", type=int, default=20)
@@ -81,7 +84,7 @@ def main() -> None:
     S = int(md_cfg.get("save_interval_steps", 50))
     jump_steps = args.k_steps * S
     corr_steps = max(1, int(round(args.corrector_fraction * jump_steps)))
-    full_steps = jump_steps + corr_steps
+    full_steps = jump_steps + corr_steps  # baseline frame cadence used for the MD timing
     mols = args.molecules or json.loads((args.splits_dir / "test.json").read_text())["molecules"]
     conditions = dict(c.split("=", 1) for c in args.condition)
 
@@ -104,9 +107,14 @@ def main() -> None:
         res["micro_step_s"] = res["baseline_s_per_ps"] * float(md_cfg.get("dt_fs", 2.0)) * 1e-3
         for label, spec in conditions.items():
             predictor = make_predictor(spec, device, args.flow_steps)
+            k = getattr(getattr(predictor, "model", predictor), "k_steps", None) or args.k_steps
+            jump_k = int(k) * S
             corr = OpenMMCorrector(args.raw_root / mol, md_cfg, seed=1, platform=best_plat)
-            opts = HybridOptions(jump_time_ps=jump_steps * corr.micro_dt_ps, corrector_steps=corr_steps,
-                                 max_bond_strain=0.0, max_attempts=1)
+            corr_k = max(1, int(round(args.corrector_fraction * jump_k)))
+            opts = HybridOptions(jump_time_ps=jump_k * corr.micro_dt_ps, corrector_steps=corr_k,
+                                 max_attempts=args.max_attempts, quench_iterations=args.quench_iterations,
+                                 thermostat_K=float(md_cfg.get("temperature_K", 300.0)) if args.thermostat else 0.0,
+                                 temperature_K=float(md_cfg.get("temperature_K", 300.0)))
             gen = torch.Generator(device=device).manual_seed(0)
             run_hybrid(predictor, corr, pos, vel, masses, init["atom_types"], args.warmup, opts, device, gen)
             if device.type == "cuda":
@@ -115,6 +123,9 @@ def main() -> None:
                            gen)["summary"]
             sim_ps = s["simulated_ps"]
             res[label] = {
+                "k_steps": int(k),
+                "force_call_savings": s["force_call_savings"],
+                "accepted_fraction": s["accepted_fraction"],
                 "s_per_ps": s["wall_clock_s"] / sim_ps,
                 "model_s_per_ps": s["model_time_s"] / sim_ps,
                 "corrector_s_per_ps": s["corrector_time_s"] / sim_ps,
@@ -133,7 +144,7 @@ def main() -> None:
 
     labels: List[str] = list(conditions)
     lines = [f"# Wall-clock study (k={args.k_steps}, {corr_steps} corrector steps, {meta['device']})", "",
-             "Seconds of wall-clock per simulated ps (lower is better); speedup = baseline / hybrid.", "",
+             "Seconds of wall-clock per simulated ps (lower is better); speedup = baseline / hybrid. Hybrid runs use the evaluation settings (proposal checks, quench, thermostat); rejected steps fall back to MD and are included.", "",
              "| molecule | baseline (best platform) | " + " | ".join(f"{lb} s/ps (speedup, model ms/step)" for lb in labels) + " |",
              "|---|---|" + "---|" * len(labels)]
     for mol, r in results.items():
