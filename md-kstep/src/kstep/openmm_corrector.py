@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from openmm import LangevinIntegrator, Platform, XmlSerializer, unit
+from openmm import LangevinIntegrator, LocalEnergyMinimizer, Platform, XmlSerializer, unit
 from openmm.app import PDBFile, Simulation
 
 from .hybrid import CorrectorResult
@@ -41,3 +41,16 @@ class OpenMMCorrector:
             ekin=state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole),
             epot=state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole),
         )
+
+    def quench(self, positions_nm, iterations: int):
+        """A few L-BFGS iterations to relax bond/angle strain left by a learned jump.
+
+        Returns (positions, force_evaluations). OpenMM does not report the exact number
+        of energy evaluations, so this counts 2 per iteration (an upper bound for L-BFGS
+        with its line search).
+        """
+        ctx = self.sim.context
+        ctx.setPositions(np.asarray(positions_nm) * unit.nanometer)
+        LocalEnergyMinimizer.minimize(ctx, 1.0, int(iterations))
+        pos = ctx.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+        return np.asarray(pos), 2 * int(iterations)

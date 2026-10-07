@@ -154,9 +154,15 @@ class HybridOptions:
     # Langevin/canonical dynamics; prevents sampling errors in Δv from heating the system.
     thermostat_K: float = 0.0
     seed: int = 0
-    # Reject a corrected learned step if its potential energy exceeds the initial value by
-    # more than this many kT. Catches non-bonded clashes the bond-strain check cannot see.
-    max_epot_rise_kT: float = 25.0
+    # Reject a corrected learned step if its potential energy exceeds the initial value by more
+    # than the thermal rise expected from a minimum, (dof/2)·kT, plus this many standard
+    # deviations, sqrt(dof/2)·kT. Catches non-bonded clashes the bond-strain check cannot see
+    # (those are typically hundreds of kT). 0 disables the check.
+    max_epot_sigma: float = 8.0
+    # Relax fast (bond/angle) strain of an accepted proposal with this many minimiser
+    # iterations before the corrector steps (needs a corrector with ``quench``). Over a
+    # k-step jump the fast modes have fully decorrelated; the model's job is the slow ones.
+    quench_iterations: int = 0
     temperature_K: float = 300.0
 
 
@@ -238,13 +244,15 @@ def run_hybrid(
     rng = np.random.default_rng(opts.seed)
     e_target = None
     epot_max = np.inf
-    if opts.energy_rescale or opts.max_epot_rise_kT > 0:
+    if opts.energy_rescale or opts.max_epot_sigma > 0:
         init = corrector.run(pos, vel, 0)
         ekin[0], epot[0] = init.ekin, init.epot
         if opts.energy_rescale:
             e_target = init.ekin + init.epot
-        if opts.max_epot_rise_kT > 0 and np.isfinite(init.epot):
-            epot_max = init.epot + opts.max_epot_rise_kT * KB_KJ_PER_MOL_K * opts.temperature_K
+        if opts.max_epot_sigma > 0 and np.isfinite(init.epot):
+            half_dof = (3 * len(z) - 6) / 2.0
+            kt = KB_KJ_PER_MOL_K * opts.temperature_K
+            epot_max = init.epot + (half_dof + opts.max_epot_sigma * np.sqrt(half_dof)) * kt
 
     for step in range(n_macro):
         proposal = None
@@ -275,7 +283,11 @@ def run_hybrid(
         t0 = time.perf_counter()
         result = None
         if proposal is not None:
-            result = corrector.run(proposal[0], proposal[1], opts.corrector_steps)
+            prop_pos = proposal[0]
+            if opts.quench_iterations > 0:
+                prop_pos, n_eval = corrector.quench(prop_pos, opts.quench_iterations)
+                force_calls += n_eval
+            result = corrector.run(prop_pos, proposal[1], opts.corrector_steps)
             force_calls += opts.corrector_steps + overhead
             if not acceptable(result.positions, result.velocities) or not (result.epot <= epot_max):
                 result = None
@@ -346,6 +358,7 @@ def run_hybrid(
             "uq_samples": replicas,
             "energy_rescale": bool(opts.energy_rescale),
             "thermostat_K": float(opts.thermostat_K),
-            "max_epot_rise_kT": float(opts.max_epot_rise_kT),
+            "max_epot_sigma": float(opts.max_epot_sigma),
+            "quench_iterations": int(opts.quench_iterations),
         },
     }

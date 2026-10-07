@@ -127,6 +127,18 @@ class JumpPredictor:
 def test_potential_energy_guard_rejects_clashes():
     ref, vel, m, z = _setup()
     ref = ref - ref.mean(axis=0)  # equal masses: COM-centred, so the start has zero clash energy
-    opts = HybridOptions(jump_time_ps=0.4, corrector_steps=2, max_bond_strain=0.0, max_epot_rise_kT=1.0)
+    opts = HybridOptions(jump_time_ps=0.4, corrector_steps=2, max_bond_strain=0.0, max_epot_sigma=0.1)
     out = run_hybrid(JumpPredictor(), ClashCorrector(ref), ref, vel, m, z, 5, opts)
     assert out["summary"]["fallback_fraction"] == 1.0
+
+
+class QuenchingCorrector(HarmonicCorrector):
+    def quench(self, pos, iterations):
+        return self.ref.copy(), 2 * iterations
+
+
+def test_quench_counts_force_evaluations():
+    ref, vel, m, z = _setup()
+    opts = HybridOptions(jump_time_ps=0.4, corrector_steps=10, quench_iterations=5)
+    out = run_hybrid(ZeroPredictor(), QuenchingCorrector(ref), ref, vel, m, z, 4, opts)
+    assert out["summary"]["force_calls"] == 4 * (10 + 10)

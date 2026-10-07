@@ -64,8 +64,10 @@ def main() -> None:
     p.add_argument("--delta-scale", type=float, default=1.0)
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--max-bond-strain", type=float, default=0.25)
-    p.add_argument("--max-epot-rise-kt", type=float, default=25.0,
-                   help="Reject learned steps whose potential energy rises > this many kT above the start (0 = off)")
+    p.add_argument("--quench-iterations", type=int, default=0,
+                   help="Minimiser iterations relaxing bond/angle strain before the corrector steps")
+    p.add_argument("--max-epot-sigma", type=float, default=8.0,
+                   help="Reject learned steps whose potential energy rises more than (dof/2 + sigma*sqrt(dof/2)) kT above the start (0 = off)")
     p.add_argument("--max-delta-pos", type=float, default=0.0, help="Hard cap on |Δx| (nm); legacy runs used 0.2")
     p.add_argument("--max-delta-vel", type=float, default=0.0, help="Hard cap on |Δv| (nm/ps); legacy runs used 4.5")
     p.add_argument("--uq-samples", type=int, default=1, help="Flow samples per step for the uncertainty estimate")
@@ -116,7 +118,8 @@ def main() -> None:
         precheck_h_bonds=corrector.sim.system.getNumConstraints() == 0,
         thermostat_K=float(md_cfg.get("temperature_K", 300.0)) if args.thermostat == "csvr" else 0.0,
         seed=args.seed,
-        max_epot_rise_kT=args.max_epot_rise_kt,
+        max_epot_sigma=args.max_epot_sigma,
+        quench_iterations=args.quench_iterations,
         temperature_K=float(md_cfg.get("temperature_K", 300.0)),
     )
     LOGGER.info("%s | k=%d (%.3f ps jump) + %d corrector steps | %d macro-steps", info["predictor"], k,

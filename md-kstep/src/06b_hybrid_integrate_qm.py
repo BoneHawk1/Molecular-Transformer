@@ -93,8 +93,8 @@ def main() -> None:
     p.add_argument("--delta-scale", type=float, default=1.0)
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--max-bond-strain", type=float, default=0.2)
-    p.add_argument("--max-epot-rise-kt", type=float, default=25.0,
-                   help="Reject learned steps whose potential energy rises > this many kT above the start (0 = off)")
+    p.add_argument("--max-epot-sigma", type=float, default=8.0,
+                   help="Reject learned steps whose potential energy rises more than (dof/2 + sigma*sqrt(dof/2)) kT above the start (0 = off)")
     p.add_argument("--uq-samples", type=int, default=1)
     p.add_argument("--uq-threshold", type=float, default=float("inf"))
     p.add_argument("--flow-steps", type=int, default=None)
@@ -132,7 +132,7 @@ def main() -> None:
                          uq_samples=args.uq_samples, uq_threshold=args.uq_threshold,
                          sampler_kwargs={"steps": args.flow_steps} if args.flow_steps else {},
                          log_every=max(args.steps // 10, 1), energy_rescale=args.energy_rescale,
-                         max_epot_rise_kT=args.max_epot_rise_kt, temperature_K=float(qm_cfg.get("temperature_K", 300.0)))
+                         max_epot_sigma=args.max_epot_sigma, temperature_K=float(qm_cfg.get("temperature_K", 300.0)))
     LOGGER.info("%s | %s corrector | k=%d (%.1f fs jump) + %d Verlet steps", info["predictor"], backend, k,
                 jump_time_ps * 1e3, args.corrector_steps)
     gen = torch.Generator(device=device).manual_seed(args.seed)
