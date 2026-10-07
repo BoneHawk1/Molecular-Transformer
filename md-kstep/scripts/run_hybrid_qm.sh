@@ -4,13 +4,13 @@
 
 set -euo pipefail
 
-CHECKPOINT=${CHECKPOINT:-"outputs/checkpoints_transformer_qm_scratch/best.pt"}
-MODEL_CONFIG=${MODEL_CONFIG:-"configs/model_qm.yaml"}
+CHECKPOINT=${CHECKPOINT:-"outputs/v2/qm_flow_k40/best.pt"}
+MODEL_CONFIG=${MODEL_CONFIG:-""}  # only for legacy (2025) checkpoints, e.g. configs/legacy/model_qm.yaml
 QM_CONFIG=${QM_CONFIG:-"configs/qm.yaml"}
 QM_TRAJ_DIR=${QM_TRAJ_DIR:-"data/qm"}
 OUT_DIR=${OUT_DIR:-"outputs/hybrid_qm_scratch"}
 STEPS=${STEPS:-100}
-K_STEPS=${K_STEPS:-4}
+CORRECTOR_STEPS=${CORRECTOR_STEPS:-1}
 DEVICE=${DEVICE:-"cuda"}
 
 MAX_JOBS=${MAX_JOBS:-2}
@@ -32,7 +32,7 @@ if ! [[ "$DRY_RUN" =~ ^[01]$ ]]; then
     exit 1
 fi
 
-for required_file in "$MODEL_CONFIG" "$QM_CONFIG"; do
+for required_file in "$QM_CONFIG"; do
     if [ ! -f "$required_file" ]; then
         echo "Required config not found: $required_file" >&2
         exit 1
@@ -53,7 +53,7 @@ fi
 
 echo "Running hybrid QM integration"
 echo "Checkpoint: $CHECKPOINT"
-echo "Steps: $STEPS (k=$K_STEPS)"
+echo "Steps: $STEPS (corrector steps: $CORRECTOR_STEPS)"
 echo "Output: $OUT_DIR"
 echo "Max parallel jobs: $MAX_JOBS"
 echo "Device: $DEVICE"
@@ -114,28 +114,24 @@ start_job() {
     local mol_name
     mol_name=$(basename "$mol_dir")
     local traj_file="$mol_dir/trajectory.npz"
-    local out_file="$OUT_DIR/${mol_name}_hybrid_k${K_STEPS}.npz"
+    local out_file="$OUT_DIR/${mol_name}_hybrid.npz"
     local log_file="$OUT_DIR/${mol_name}.log"
     local omp_stack="${OMP_STACKSIZE:-4G}"
 
     local -a cmd=(
         python src/06b_hybrid_integrate_qm.py
         --checkpoint "$CHECKPOINT"
-        --model-config "$MODEL_CONFIG"
         --qm-config "$QM_CONFIG"
         --qm-traj "$traj_file"
         --out "$out_file"
         --frame 0
         --steps "$STEPS"
-        --k-steps "$K_STEPS"
+        --corrector-steps "$CORRECTOR_STEPS"
         --device "$DEVICE"
-        --max-delta-pos 0.02
-        --max-delta-vel 2.0
-        --delta-scale 0.5
-        --pos-threshold 1.0
-        --vel-threshold 50.0
-	--energy-rescale        
     )
+    if [ -n "$MODEL_CONFIG" ]; then
+        cmd+=(--model-config "$MODEL_CONFIG")
+    fi
 
     echo "Launching $mol_name -> $out_file (log: $log_file)"
 

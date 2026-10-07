@@ -6,7 +6,7 @@ set -e
 
 QM_ROOT="data/qm"
 SPLITS_DIR="data/qm_splits"
-K_STEPS="4"  # Start with k=4 for QM (1 fs macro-step)
+K_STEPS=${K_STEPS:-"4 40"}  # stored every 0.25 fs step: k=4 is 1 fs, k=40 is 10 fs
 
 echo "Creating QM dataset from trajectories in $QM_ROOT"
 echo "k-step values: $K_STEPS"
@@ -23,7 +23,6 @@ python src/02_make_dataset.py \
     --ks $K_STEPS \
     --stride 1 \
     --max-samples-per-mol 50000 \
-    --augment-rotations 3 \
     --seed 42
 
 echo ""
