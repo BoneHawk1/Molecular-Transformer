@@ -83,7 +83,8 @@ def fmt(x) -> str:
 
 def summarise(results: Dict, splits: Dict[str, str], labels: List[str]) -> str:
     lines = ["# Hybrid evaluation summary", "",
-             "Means over molecules. *noise floor* = second baseline seed vs baseline, at the same frame spacing.", ""]
+             "Ratio columns are medians over molecules (ratios blow up for molecules where MD barely moves); "
+             "other columns are means. *noise floor* = second baseline seed vs baseline, at the same frame spacing.", ""]
     groups = {"test": [m for m in results if splits.get(m) == "test"],
               "val": [m for m in results if splits.get(m) == "val"],
               "train": [m for m in results if splits.get(m) == "train"],
@@ -106,7 +107,8 @@ def summarise(results: Dict, splits: Dict[str, str], labels: List[str]) -> str:
                             xs.append(results[m][any_label]["noise_floor"].get(key, np.nan))
                     elif cond in results[m]:
                         xs.append(results[m][cond]["metrics"].get(key, np.nan))
-                vals.append(float(np.nanmean(xs)) if xs and np.isfinite(xs).any() else None)
+                agg = np.nanmedian if key.endswith("_ratio") else np.nanmean
+                vals.append(float(agg(xs)) if xs and np.isfinite(xs).any() else None)
             if cond != "noise_floor":
                 runs = [results[m][cond]["run"] for m in mols if cond in results[m]]
                 for f in ("force_call_savings", "accepted_fraction"):

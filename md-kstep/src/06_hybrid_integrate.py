@@ -64,7 +64,7 @@ def main() -> None:
     p.add_argument("--delta-scale", type=float, default=1.0)
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--max-bond-strain", type=float, default=0.25)
-    p.add_argument("--quench-mode", choices=["full", "thermal"], default="full",
+    p.add_argument("--quench-mode", choices=["full", "thermal"], default="thermal",
                    help="'thermal' stops the quench at the equilibrium potential-energy level")
     p.add_argument("--quench-iterations", type=int, default=0,
                    help="Minimiser iterations relaxing bond/angle strain before the corrector steps")

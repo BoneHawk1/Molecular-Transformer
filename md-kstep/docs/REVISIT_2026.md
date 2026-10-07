@@ -114,15 +114,19 @@ Setup:
 
 ### 3.1 Classical MD (all 12 molecules)
 
+Ratio columns are medians over molecules; the others are means. These numbers were
+recomputed after a bug fix in the torsion-flip counter: the first version split the trans
+well at ±180°, so ordinary fluctuations counted as flips. Wells now use hysteresis.
+
 | condition | lag-RMSD ratio | torsion-step ratio | torsion flip-rate ratio | torsion JS | angle JS | bond JS | ⟨KE⟩ ratio | force calls saved | learned steps accepted |
 |---|---|---|---|---|---|---|---|---|---|
-| **noise floor** (MD seed 2) | 1.00 | 1.00 | 1.01 | 0.062 | 0.006 | 0.006 | 1.00 | – | – |
-| corrector only (Δ=0) | 0.59 | 0.74 | 0.84 | 0.141 | 0.007 | 0.009 | 1.00 | 21× | 100 % |
-| corrector only + quench | 0.16 | 0.20 | 0.69 | 0.300 | 0.362 | 0.380 | 1.00 | 7× | 100 % |
-| 2025 Transformer-EGNN (as published: Δ×0.5, caps) | 0.32 | 0.34 | 0.71 | 0.203 | 0.103 | 0.081 | **0.74** | 18× | 99 % |
-| new deterministic (mean), k=4 | 0.28 | 0.29 | 0.64 | 0.226 | 0.267 | 0.273 | 1.00 | 5.2× | 93 % |
-| **new stochastic (flow), k=4** | 0.85 | 0.87 | 0.89 | 0.076 | 0.045 | 0.114 | 1.00 | 6.4× | 93 % |
-| **new stochastic (flow), k=8** | **0.94** | **1.00** | **0.94** | 0.086 | 0.036 | 0.065 | 0.99 | **8.4×** | 90 % |
+| **noise floor** (MD seed 2) | 0.99 | 1.00 | 0.99 | 0.062 | 0.006 | 0.006 | 1.00 | – | – |
+| corrector only (Δ=0) | 0.55 | 0.72 | 0.47 | 0.141 | 0.007 | 0.009 | 1.00 | 21× | 100 % |
+| corrector only + quench | 0.17 | 0.21 | 0.00 | 0.300 | 0.362 | 0.380 | 1.00 | 7× | 100 % |
+| 2025 Transformer-EGNN (as published: Δ×0.5, caps) | 0.28 | 0.30 | 0.07 | 0.203 | 0.103 | 0.081 | **0.74** | 18× | 99 % |
+| new deterministic (mean), k=4 | 0.33 | 0.31 | 0.03 | 0.226 | 0.267 | 0.273 | 1.00 | 5.2× | 93 % |
+| **new stochastic (flow), k=4** | 0.85 | 0.91 | 0.89 | 0.076 | 0.045 | 0.114 | 1.00 | 6.4× | 93 % |
+| **new stochastic (flow), k=8** | **0.98** | **0.96** | 1.19 | 0.086 | 0.036 | 0.065 | 0.99 | **8.4×** | 90 % |
 
 ![metrics overview](results_2026/metrics_overview_all.png)
 
@@ -196,27 +200,140 @@ What this shows:
 * Wall times in this run are only indicative: the 7 molecules ran in parallel on a shared
   CPU.
 
+### 3.4 Round 2: 89 more molecules, sampler noise, thermal quench, aspirin
+
+These runs use the same pipeline and add the follow-ups below. All are in
+[`results_2026_round2/`](results_2026_round2/).
+
+**More molecules.**
+* `data/molecules_extra.smi` adds 89 small organics: alcohols, ethers, amines, acids,
+  esters, amides including alanine dipeptide, amino acids, aromatics, heterocycles,
+  S/F/Cl compounds, and drug-like fragments up to ibuprofen at 33 atoms.
+* Each got 1 ns of MD on phalanx, about 90 min of GPU time in total.
+* New splits (`data/splits_v2`): 77 train / 9 val / 15 test. The original held-out
+  molecules stay held out.
+* All 24 held-out molecules have a second-seed reference run.
+
+**Models.** Three flow models, each 40k steps on 385k training windows (stride 2):
+* k=8 at the old size (0.86 M parameters);
+* k=8 large (192 wide × 5 layers, 2.3 M parameters), trained on convergence's P40, which
+  ran it about 2× faster than phalanx's shared GPU at the time;
+* k=12.
+
+**Late noise injection did not fix the narrow bond and angle distributions; the thermal
+quench did.** The flow's reverse SDE was tested with noise injected after t = 0.5 (score
+derived from the learned velocity field), against two quench modes. Same k=8 model,
+4 molecules:
+
+| variant | bond JS | angle JS | force calls saved | accepted |
+|---|---|---|---|---|
+| noise floor | 0.012 | 0.012 | – | – |
+| ODE sampler + full quench (round 1) | 0.029 | 0.027 | 6.0× | 74 % |
+| SDE ε=1 + full quench | 0.033 | 0.034 | 5.0× | 76 % |
+| **ODE sampler + thermal quench** | **0.015** | **0.018** | **6.9×** | 74 % |
+| SDE ε=1 + thermal quench | 0.018 | 0.022 | 5.8× | 77 % |
+| SDE ε=3 | (all proposals rejected → plain MD) | | 1.0× | 0 % |
+
+* The narrow distributions came from the full quench freezing out bond and angle
+  vibrations, not from the sampler.
+* The thermal quench stops minimizing once the potential energy is back to
+  E_min + (dof/2)·kT. It is now the default (`--quench-mode thermal --quench-iterations 20`).
+* Extra sampling noise only adds strain that the quench must then remove.
+
+**Why aspirin was rejected.** The new rejection diagnostics (`summary.rejection_reasons`,
+`summary.worst_bonds`) showed that 92 % of its learned steps failed the pre-corrector
+bond-strain check:
+
+| bond | rejections |
+|---|---|
+| ester C1–O3, joining the acetyl group to the ring oxygen | 457 |
+| acid O–H | 199 |
+| C1=O2 | 110 |
+
+The acetyl group swings as a rigid unit about the aryl–O bond. None of the original 8
+training molecules has that motif, so the model moved the group's atoms inconsistently.
+With esters in the training set (methyl acetate, ethyl acetate, phenyl acetate, methyl
+acetylsalicylate):
+
+* aspirin's acceptance went from 12 % to **100 %**;
+* its dynamics ratios are 1.00 (lag RMSD) and 0.90 (torsion flips);
+* torsion JS is 0.069 against a floor of 0.006.
+
+Ibuprofen, the largest molecule at 33 atoms, went from 0 % to 53 % accepted.
+
+**Held-out results (24 molecules; ratio columns are medians).**
+
+| condition | lag-RMSD | torsion step | torsion flips | torsion JS | angle JS | bond JS | pair-dist L1 | force calls saved | accepted |
+|---|---|---|---|---|---|---|---|---|---|
+| noise floor | 1.00 | 1.00 | 0.97 | 0.040 | 0.012 | 0.012 | 0.036 | – | – |
+| corrector only (k=8, thermal quench) | 0.71 | 0.85 | 0.46 | 0.083 | 0.024 | 0.025 | 0.081 | 18.6× | 100 % |
+| flow k=8, 12 training molecules (round 1) | 0.98 | 0.99 | 1.02 | 0.108 | 0.030 | 0.041 | 0.167 | 7.5× | 86 % |
+| flow k=8, 101 molecules | 1.13 | 1.06 | 1.67 | 0.116 | 0.020 | 0.038 | 0.129 | 10.9× | 97 % |
+| **flow k=8 large, 101 molecules** | 1.03 | 1.08 | 1.43 | 0.112 | **0.020** | 0.038 | **0.115** | **11.4×** | 97 % |
+| flow k=12, 101 molecules | 1.14 | 1.12 | 1.89 | 0.121 | 0.027 | 0.034 | 0.115 | 8.3× | 91 % |
+
+![round-2 overview](results_2026_round2/metrics_overview_all.png)
+
+What changed with 8× more molecules and the larger model:
+
+* Robustness and structure improved:
+  * acceptance 86 → 97 %;
+  * force calls saved 7.5× → 11.4×;
+  * angle JS −33 % and pair-distance L1 −31 %;
+  * the 12-molecule model's cis-amide flips in alanine dipeptide (an unphysical
+    isomerization with an ~80 kJ/mol barrier) are gone. See
+    [`torsions_CC__O_NC_C_C__O_NC.png`](results_2026_round2/torsions_CC__O_NC_C_C__O_NC.png).
+* **Kinetics got worse, not better.** Every flow model crosses torsional barriers too
+  often: flip ratio 1.4–1.9 against 0.97 for the floor. Rings show the same effect:
+  * cyclohexane stays a chair 93 % of the time but chair-flips 11 times in 1 ns, where MD
+    shows none (the real flip takes microseconds);
+  * alanine dipeptide's φ ≈ ±70° basins are heavily populated, while 1 ns of MD stays
+    near −150°.
+
+  This is also why torsion JS (0.11) is above the corrector-only control (0.083): the
+  control barely moves, so it stays in MD's starting basin. Because the 1 ns references
+  are not converged for these slow modes, torsion JS cannot say whether the flow's
+  populations are right. The flip rates show that the kinetics are not.
+* The larger model brought the flip ratio closest to MD among the 101-molecule models
+  (1.43 vs 1.67; val molecules 1.51 vs 2.96). Capacity helps, so the problem is not data
+  volume alone.
+* k=12 overshoots everywhere: more motion per step and lower acceptance.
+
+**Wall-clock.** The round-2 timing study is in `results_2026_round2/time_study_contended.md`
+but should not be cited. Another project held phalanx's GPU at 99 % during it, which
+inflated the MD baseline 4–8×. The clean round-1 measurement (~2.2× at k=8) stands. The
+round-2 models have similar latency, and save 11× rather than 8× of the force calls.
+
+**Should we add OMol25?** Not as k-step training data: it holds single-point DFT
+energies and forces, not trajectories, and our classical targets come from OpenFF. It
+would help in two other ways:
+* pretraining the backbone on OMol25 energies and forces to improve chemical
+  generalization (the aspirin problem);
+* running MD with an OMol25-trained potential (UMA) to get near-DFT reference
+  trajectories, which matters most for the QM side.
+
+Round 2 shows that data volume helped robustness and transfer to unseen chemistry, but the
+next bottleneck is kinetics, which more data alone did not fix.
+
 ## 4. What to do next
 
-1. **Fast modes.** Replace the quench with something that thermalizes bonds and angles
-   properly. Options:
-   * a short constrained or SHAKE-style projection, followed by enough Langevin steps to
-     re-equilibrate (~50 fs);
-   * have the model predict only slow/internal coordinates and resample the fast ones from
-     their known Boltzmann distribution;
-   * train with HBond constraints. The force-field XML has none, although `md.yaml` claims
-     `constraints: HBonds`; `01` should apply them.
-2. **More molecules.** Eight training molecules cause overfitting: the mean model's
-   validation loss is best at 4k steps, the flow's at 11k, and the QM flow's at 6k. Generate
-   more diverse baselines, subsample windows more sparsely, and add dropout.
-3. **Larger k on flexible molecules.** k=8 was better than k=4 on dynamics and cost. Try
-   k=12–20 now that the rollouts are stable.
-4. **Uncertainty-triggered escalation is implemented** (`--uq-samples`, `--uq-threshold`,
-   tested) but not tuned. The flow models' spread could not yet separate good from bad
-   jumps at a useful threshold. With better-calibrated models this becomes the
-   accuracy/cost dial.
-5. **QM.** Retrain with fewer overlapping windows (stride ≥ 40) and early stopping. Then
-   rerun `06b` with `--energy-rescale` against the k=40 baselines.
+1. **Correct the kinetics.** The flow proposes barrier crossings too often. The
+   principled fix is a Metropolis–Hastings acceptance step that uses the flow's exact
+   likelihood (as in Timewarp) together with the Boltzmann factor, so that accepted
+   jumps preserve the equilibrium distribution. A cheaper alternative is to train on
+   longer trajectories, where barrier-crossing pairs are represented at their true rate.
+2. **Converged references.** One nanosecond is too short for cyclohexane chair flips or
+   alanine-dipeptide φ basins. Run ≥ 50 ns references, or enhanced-sampling references,
+   for a few flexible test molecules so torsion populations can be judged.
+3. **Pretraining.** Pretrain the PaiNN backbone on OMol25 (or SPICE) energies and forces,
+   then fine-tune for k-step jumps, to improve unseen chemistry further. Ibuprofen is
+   still only 53 % accepted.
+4. **QM.** Retrain with fewer overlapping windows (stride ≥ 40) and early stopping. Then
+   rerun `06b` with `--energy-rescale` against the k=40 baselines. Consider UMA as the QM
+   reference.
+5. **Uncertainty-triggered escalation** is implemented but untuned. Once rejections are
+   rarer, the spread across samples could gate the expensive barrier-crossing proposals,
+   which is exactly where the model is wrong.
 
 ## 5. Reproducing
 

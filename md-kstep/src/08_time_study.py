@@ -66,7 +66,8 @@ def main() -> None:
                    help="label=spec; spec is 'zero', a v2 checkpoint, or legacy 'ckpt.pt:model.yaml'")
     p.add_argument("--flow-steps", type=int, default=None)
     p.add_argument("--k-steps", type=int, default=4, help="Jump length for predictors without a stored k (zero)")
-    p.add_argument("--quench-iterations", type=int, default=10)
+    p.add_argument("--quench-iterations", type=int, default=20)
+    p.add_argument("--quench-mode", choices=["full", "thermal"], default="thermal")
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--no-thermostat", dest="thermostat", action="store_false")
     p.add_argument("--corrector-fraction", type=float, default=0.05)
@@ -113,6 +114,7 @@ def main() -> None:
             corr_k = max(1, int(round(args.corrector_fraction * jump_k)))
             opts = HybridOptions(jump_time_ps=jump_k * corr.micro_dt_ps, corrector_steps=corr_k,
                                  max_attempts=args.max_attempts, quench_iterations=args.quench_iterations,
+                                 quench_mode=args.quench_mode,
                                  thermostat_K=float(md_cfg.get("temperature_K", 300.0)) if args.thermostat else 0.0,
                                  temperature_K=float(md_cfg.get("temperature_K", 300.0)))
             gen = torch.Generator(device=device).manual_seed(0)

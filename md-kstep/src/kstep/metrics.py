@@ -68,9 +68,33 @@ def wrap_deg(x: np.ndarray) -> np.ndarray:
     return (x + 180.0) % 360.0 - 180.0
 
 
-def torsion_wells(phi_deg: np.ndarray) -> np.ndarray:
-    """Assign each torsion value to one of three 120° wells (0: g-, 1: cis-ish/g+, 2: trans)."""
-    return np.digitize(phi_deg, [-60.0, 60.0])
+WELL_CENTERS_DEG = np.array([-60.0, 60.0, 180.0])
+
+
+def torsion_wells(phi_deg: np.ndarray, core_deg: float = 30.0) -> np.ndarray:
+    """Assign each frame of each torsion to a staggered well (-60, 60, 180) with hysteresis.
+
+    A torsion only changes well once it gets within ``core_deg`` of the new well's centre;
+    in between it keeps its previous assignment. This avoids counting fluctuations across
+    a boundary (e.g. around ±180 or around 0 for planar torsions) as transitions.
+    Frames before the first assignment get -1. ``phi_deg`` is ``(T, K)``.
+    """
+    phi = np.asarray(phi_deg, dtype=np.float64)
+    dist = np.abs(wrap_deg(phi[..., None] - WELL_CENTERS_DEG))      # (T, K, 3)
+    nearest = dist.argmin(-1)
+    in_core = dist.min(-1) < core_deg
+    out = np.full(phi.shape, -1, dtype=np.int64)
+    state = np.full(phi.shape[1:], -1, dtype=np.int64)
+    for t in range(phi.shape[0]):
+        state = np.where(in_core[t], nearest[t], state)
+        out[t] = state
+    return out
+
+
+def count_transitions(wells: np.ndarray) -> int:
+    """Number of well changes, ignoring frames that are not yet assigned (-1)."""
+    a, b = wells[:-1], wells[1:]
+    return int(((a != b) & (a >= 0) & (b >= 0)).sum())
 
 
 class Topology:
@@ -109,8 +133,7 @@ def dynamics_stats(traj: np.ndarray, topo: Topology, frame_ps: float, masses: Op
     if len(topo.torsions):
         phi = dihedrals_deg(traj, topo.torsions)
         out["torsion_step_deg"] = float(np.abs(wrap_deg(np.diff(phi, axis=0))).mean())
-        wells = torsion_wells(phi)
-        flips = (np.diff(wells, axis=0) != 0).sum()
+        flips = count_transitions(torsion_wells(phi))
         out["torsion_transitions_per_ps"] = float(flips / ((T - 1) * frame_ps * len(topo.torsions)))
     else:
         out["torsion_step_deg"] = float("nan")

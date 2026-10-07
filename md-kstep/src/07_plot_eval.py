@@ -66,6 +66,10 @@ def torsion_plot(mol: str, base: Dict, runs: Dict[str, Dict], lag: int, out: Pat
     topo = Topology(base["pos"][0], base["atom_types"])
     if not len(topo.torsions):
         return
+    # Prefer torsions made only of heavy atoms (backbone/ring), then the rest
+    heavy = np.asarray(base["atom_types"]) > 1
+    order = sorted(range(len(topo.torsions)), key=lambda i: not bool(heavy[topo.torsions[i]].all()))
+    topo.torsions = topo.torsions[order]
     n_show = min(4, len(topo.torsions))
     fig, axes = plt.subplots(1, n_show, figsize=(3.2 * n_show, 2.8), squeeze=False)
     bins = np.linspace(-180, 180, 37)

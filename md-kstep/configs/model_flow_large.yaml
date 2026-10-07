@@ -1,0 +1,10 @@
+# Larger flow model for the 101-molecule dataset (Oct 2026 round 2).
+kind: flow
+hidden_dim: 192
+num_layers: 5
+num_rbf: 32
+cutoff_nm: 1.2
+msg_norm: 8.0
+time_embed_dim: 32
+flow_steps: 8
+flow_solver: heun

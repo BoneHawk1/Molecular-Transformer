@@ -49,3 +49,15 @@ def test_frozen_trajectory_has_low_lag_rmsd_ratio():
     m = compare({"pos": traj}, {"pos": frozen}, topo, 0.4, 0.4, np.full(4, 12.0))
     assert m["lag_rmsd_A_ratio"] < 0.2
     assert m["bond_js"] > 0.1
+
+
+def test_torsion_transitions_use_hysteresis():
+    from kstep.metrics import count_transitions, torsion_wells
+    # fluctuating around 180 (crossing the ±180 seam) and around 0 (planar): no transitions
+    trans = np.array([179.0, -179.0, 178.0, -175.0, 177.0])[:, None]
+    planar = np.array([5.0, -5.0, 8.0, -3.0, 2.0])[:, None]
+    assert count_transitions(torsion_wells(trans)) == 0
+    assert count_transitions(torsion_wells(planar)) == 0
+    # a real gauche+ -> trans -> gauche- path: two transitions, with excursions in between ignored
+    path = np.array([60.0, 90.0, 100.0, 175.0, 140.0, -150.0, -70.0])[:, None]
+    assert count_transitions(torsion_wells(path)) == 2
