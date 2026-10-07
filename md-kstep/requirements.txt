@@ -1,0 +1,24 @@
+# md-kstep dependencies (Python 3.11). Install PyTorch for your CUDA version first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# Unit tests only need: torch numpy pyyaml pytest
+
+# Core
+numpy
+pyyaml
+matplotlib
+torch>=2.2
+
+# Classical MD baselines + hybrid corrector
+openmm>=8.0
+rdkit                 # 00_prep_mols, QM trajectory setup
+openff-toolkit        # 00_prep_mols (SMIRNOFF parameters)
+
+# QM (optional): conda install -c conda-forge xtb-python ase ; pip install pyscf [gpu4pyscf-cuda12x]
+# ase
+# xtb
+# pyscf
+
+# Optional
+wandb                 # experiment tracking (train config: wandb.enabled)
+pytest                # tests/
+# torch_geometric     # only for evaluating legacy (2025) checkpoints faster; not required

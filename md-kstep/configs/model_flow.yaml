@@ -1,0 +1,11 @@
+# Stochastic k-step model: conditional flow matching on an E(3)-equivariant PaiNN backbone.
+# Samples (Δx, Δv) ~ p(· | x_t, v_t), matching the stochastic Langevin reference dynamics.
+kind: flow
+hidden_dim: 128
+num_layers: 4
+num_rbf: 32
+cutoff_nm: 1.2
+msg_norm: 8.0
+time_embed_dim: 32
+flow_steps: 8        # ODE steps at sampling time (Heun: 2 network calls per step)
+flow_solver: heun

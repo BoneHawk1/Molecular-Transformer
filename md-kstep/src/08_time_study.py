@@ -1,309 +1,173 @@
-"""Time study comparing baseline MD, EGNN hybrid, and Transformer hybrid.
+"""Wall-clock study: baseline OpenMM vs. hybrid predictors, measured back-to-back.
 
-For each molecule:
-- Measure baseline OpenMM wall-clock via a short run, estimate full-run time
-- Read hybrid runs (EGNN + Transformer) and their wall-clock from metadata
-- Compute per-step bond-length RMSE vs baseline for EGNN and Transformer
+The 2025 study extrapolated the baseline from a few un-warmed macro-steps. Here every
+condition is warmed up (CUDA graph capture, OpenMM kernel compilation) and then timed
+over the same number of macro-steps on an otherwise idle machine. The baseline is
+timed on every requested OpenMM platform and the hybrid corrector uses the fastest
+one, so the comparison is against the best available reference.
 
-Outputs
-- JSON summary with times and speedups per molecule
-- Bar chart of wall-clock per method per molecule (single figure)
-- Line chart of accuracy (bond RMSE) per time step for EGNN vs Transformer
+Example::
+
+    python src/08_time_study.py --md-config configs/md.yaml \\
+        --condition zero=zero mean=outputs/v2/mean_k4/best.pt flow=outputs/v2/flow_k4/best.pt \\
+        --out-dir outputs/v2/time_study
+
+Run it with nothing else on the GPU; contention distorts small-kernel timings badly.
 """
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import torch
 
-from utils import configure_logging, ensure_dir, load_yaml, remove_com, LOGGER
-from openmm import (LangevinIntegrator, Platform, XmlSerializer, unit)
-from openmm.app import PDBFile, Simulation
-
-
-class MDConfig:
-    def __init__(self, cfg: Dict):
-        self.dt_fs = cfg.get("dt_fs", 2.0)
-        self.temperature_K = cfg.get("temperature_K", 300.0)
-        self.friction_per_ps = cfg.get("friction_per_ps", 1.0)
-        self.save_interval_steps = int(cfg.get("save_interval_steps", 50))
-        self.platform = cfg.get("platform", "CUDA")
-        self.constraints = cfg.get("constraints", "HBonds")
-        self.random_seed = int(cfg.get("random_seed", 42))
-        self.nve_window_ps = float(cfg.get("nve_window_ps", 0.0))
-        self.nve_every_ps = float(cfg.get("nve_every_ps", 0.0))
+from kstep.common import LOGGER, configure_logging, load_trajectory, load_yaml, remove_com, write_json
+from kstep.hybrid import CudaGraphPredictor, HybridOptions, ZeroPredictor, run_hybrid
+from kstep.model import KStepModel, load_predictor
+from kstep.openmm_corrector import OpenMMCorrector
 
 
-def _load_openmm_bundle(molecule_dir: Path):
-    pdb_path = molecule_dir / "structure.pdb"
-    xml_path = molecule_dir / "forcefield.xml"
-    pdb = PDBFile(str(pdb_path))
-    with xml_path.open("r", encoding="utf-8") as handle:
-        system = XmlSerializer.deserialize(handle.read())
-    return pdb, system
+def time_baseline(corrector: OpenMMCorrector, pos, vel, masses, full_steps: int, n_macro: int, warmup: int) -> float:
+    """Seconds per simulated ps for plain MD that stores one frame per macro-step."""
+    for _ in range(warmup):
+        r = corrector.run(pos, vel, full_steps)
+        pos, vel = remove_com(r.positions, r.velocities, masses)
+    t0 = time.perf_counter()
+    for _ in range(n_macro):
+        r = corrector.run(pos, vel, full_steps)
+        pos, vel = remove_com(r.positions, r.velocities, masses)
+    return (time.perf_counter() - t0) / (n_macro * full_steps * corrector.micro_dt_ps)
 
 
-def load_openmm_sim(molecule_dir: Path, md_cfg: MDConfig) -> Simulation:
-    pdb, system = _load_openmm_bundle(molecule_dir)
-    integrator = LangevinIntegrator(
-        md_cfg.temperature_K * unit.kelvin,
-        md_cfg.friction_per_ps / unit.picosecond,
-        md_cfg.dt_fs * unit.femtosecond,
-    )
-    integrator.setRandomNumberSeed(md_cfg.random_seed)
-    platform = Platform.getPlatformByName(md_cfg.platform)
-    return Simulation(pdb.topology, system, integrator, platform)
-
-
-def apply_corrector(simulation: Simulation, positions_nm: np.ndarray, velocities_nm_per_ps: np.ndarray, steps: int) -> Dict[str, np.ndarray]:
-    simulation.context.setPositions(positions_nm * unit.nanometer)
-    simulation.context.setVelocities(velocities_nm_per_ps * (unit.nanometer / unit.picosecond))
-    simulation.context.applyConstraints(1e-6)
-    simulation.context.applyVelocityConstraints(1e-6)
-    micro_steps = max(1, int(steps))
-    simulation.step(micro_steps)
-    state = simulation.context.getState(getPositions=True, getVelocities=True, getEnergy=True)
-    corrected_pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-    corrected_vel = state.getVelocities(asNumpy=True).value_in_unit(unit.nanometer / unit.picosecond)
-    kinetic = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
-    potential = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-    return {
-        "positions": corrected_pos.astype(np.float32),
-        "velocities": corrected_vel.astype(np.float32),
-        "Ekin": kinetic,
-        "Epot": potential,
-    }
-
-
-def load_npz(path: Path) -> Dict:
-    data = np.load(path, allow_pickle=True)
-    metadata = json.loads(str(data["metadata"])) if "metadata" in data else {}
-    nve_windows = json.loads(str(data.get("nve_windows", "[]")))
-    return {
-        "pos": data["pos"],
-        "vel": data["vel"],
-        "time_ps": data.get("time_ps"),
-        "atom_types": data["atom_types"],
-        "masses": data["masses"],
-        "metadata": metadata,
-        "nve_windows": nve_windows,
-    }
-
-
-def guess_bonds(positions_nm: np.ndarray, atom_types: np.ndarray, tol: float = 0.1) -> List[Tuple[int, int]]:
-    # Å radii
-    radii = {1: 0.31, 6: 0.76, 7: 0.71, 8: 0.66, 9: 0.57, 15: 1.07, 16: 1.05, 17: 1.02}
-    coords = positions_nm * 10.0
-    n = coords.shape[0]
-    bonds: List[Tuple[int, int]] = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            ri = radii.get(int(atom_types[i]), 0.75)
-            rj = radii.get(int(atom_types[j]), 0.75)
-            cutoff = ri + rj + tol
-            if np.linalg.norm(coords[i] - coords[j]) <= cutoff:
-                bonds.append((i, j))
-    return bonds
-
-
-def measure_bonds(positions_nm: np.ndarray, bonds: List[Tuple[int, int]]) -> np.ndarray:
-    coords = positions_nm * 10.0
-    return np.asarray([np.linalg.norm(coords[i] - coords[j]) for i, j in bonds], dtype=np.float32)
-
-
-def bond_rmse_per_step(baseline_pos: np.ndarray, hybrid_pos: np.ndarray, atom_types: np.ndarray) -> np.ndarray:
-    # Build bonds from initial baseline frame
-    bonds = guess_bonds(baseline_pos[0], atom_types)
-    T = min(len(baseline_pos), len(hybrid_pos))
-    rmses: List[float] = []
-    for t in range(T):
-        b_bonds = measure_bonds(baseline_pos[t], bonds) if bonds else np.array([])
-        h_bonds = measure_bonds(hybrid_pos[t], bonds) if bonds else np.array([])
-        if b_bonds.size == 0:
-            rmses.append(np.nan)
-        else:
-            rmses.append(float(np.sqrt(np.mean((b_bonds - h_bonds) ** 2))))
-    return np.asarray(rmses, dtype=np.float32)
-
-
-def estimate_baseline_time(molecule_dir: Path, md_cfg: Path, initial_npz: Path, steps: int, k_steps: int, device: str) -> Tuple[float, Dict]:
-    # Short baseline run to estimate time per micro-step, then scale
-    # Load md.yaml
-    md_data = load_yaml(md_cfg)
-    cfg = MDConfig(md_data)
-    # baseline micro-steps per macro-step
-    baseline_steps = max(1, int(k_steps * cfg.save_interval_steps))
-    short_macros = max(2, min(5, steps))
-
-    # Minimal loader for initial state
-    data = np.load(initial_npz, allow_pickle=True)
-    positions = data["pos"][0]
-    velocities = data["vel"][0]
-    masses = data["masses"]
-    state = {"positions": positions, "velocities": velocities, "masses": masses}
-    masses_np = state["masses"].astype(np.float32)
-    positions_np, velocities_np = remove_com(state["positions"], state["velocities"], masses_np)
-
-    sim = load_openmm_sim(molecule_dir, cfg)
-    # Set CUDA or CPU via platform in md config; device arg unused here, but kept for symmetry
-
-    pos = positions_np
-    vel = velocities_np
-    start = time.perf_counter()
-    total_calls = 0
-    for _ in range(short_macros):
-        corr = apply_corrector(sim, pos, vel, baseline_steps)
-        total_calls += baseline_steps
-        pos, vel = remove_com(corr["positions"], corr["velocities"], masses_np)
-    short_wall = time.perf_counter() - start
-    per_call = short_wall / max(total_calls, 1)
-    est_full = per_call * (steps * baseline_steps)
-    meta = {
-        "short_macros": short_macros,
-        "baseline_steps": baseline_steps,
-        "short_wall_s": short_wall,
-        "per_micro_step_s": per_call,
-        "est_full_wall_s": est_full,
-        "total_micro_steps_full": steps * baseline_steps,
-    }
-    return est_full, meta
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--baseline-root", type=Path, default=Path("data/md"))
-    p.add_argument("--egnn-root", type=Path, default=Path("outputs/hybrid_cf05_long"))
-    p.add_argument("--transformer-root", type=Path, default=Path("outputs/hybrid_transformer_cf05_long"))
-    p.add_argument("--md-config", type=Path, default=Path("configs/md.yaml"))
-    p.add_argument("--steps", type=int, default=50)
-    p.add_argument("--k-steps", type=int, default=4)
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--out-dir", type=Path, default=Path("outputs/time_study"))
-    return p
+def make_predictor(spec: str, device: torch.device, flow_steps: int | None):
+    if spec == "zero":
+        return ZeroPredictor()
+    if ":" in spec and not Path(spec).exists():  # legacy checkpoint:yaml
+        ckpt, cfg = spec.split(":", 1)
+        return load_predictor(Path(ckpt), device, legacy_model_config=load_yaml(Path(cfg)))
+    model = load_predictor(Path(spec), device)
+    if flow_steps:
+        model.cfg.flow_steps = flow_steps
+    return CudaGraphPredictor(model) if isinstance(model, KStepModel) and device.type == "cuda" else model
 
 
 def main() -> None:
-    args = build_argparser().parse_args()
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--md-config", type=Path, default=Path("configs/md.yaml"))
+    p.add_argument("--raw-root", type=Path, default=Path("data/raw"))
+    p.add_argument("--md-root", type=Path, default=Path("data/md"))
+    p.add_argument("--molecules", nargs="*", default=None, help="Default: test split")
+    p.add_argument("--splits-dir", type=Path, default=Path("data/splits"))
+    p.add_argument("--condition", nargs="+", required=True,
+                   help="label=spec; spec is 'zero', a v2 checkpoint, or legacy 'ckpt.pt:model.yaml'")
+    p.add_argument("--flow-steps", type=int, default=None)
+    p.add_argument("--k-steps", type=int, default=4)
+    p.add_argument("--corrector-fraction", type=float, default=0.05)
+    p.add_argument("--macro-steps", type=int, default=300)
+    p.add_argument("--warmup", type=int, default=20)
+    p.add_argument("--platforms", nargs="+", default=["CUDA", "CPU"])
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--out-dir", type=Path, required=True)
+    args = p.parse_args()
     configure_logging()
-    ensure_dir(args.out_dir)
+    device = torch.device(args.device)
+    torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Collect molecules (names) from baseline root
-    molecules = [d.name for d in sorted(args.baseline_root.iterdir()) if (d / "trajectory.npz").exists()]
-    LOGGER.info("Found %d molecules", len(molecules))
+    md_cfg = load_yaml(args.md_config)
+    S = int(md_cfg.get("save_interval_steps", 50))
+    jump_steps = args.k_steps * S
+    corr_steps = max(1, int(round(args.corrector_fraction * jump_steps)))
+    full_steps = jump_steps + corr_steps
+    mols = args.molecules or json.loads((args.splits_dir / "test.json").read_text())["molecules"]
+    conditions = dict(c.split("=", 1) for c in args.condition)
 
-    summary: Dict[str, Dict] = {}
-    egnn_curves: List[np.ndarray] = []
-    tr_curves: List[np.ndarray] = []
+    results: Dict[str, Dict] = {}
+    for mol in mols:
+        init = load_trajectory(args.md_root / mol / "trajectory.npz")
+        masses = np.asarray(init["masses"], np.float64)
+        pos, vel = remove_com(init["pos"][0].astype(np.float64), init["vel"][0].astype(np.float64), masses)
+        res: Dict[str, Dict] = {"baseline": {}}
+        for plat in args.platforms:
+            try:
+                corr = OpenMMCorrector(args.raw_root / mol, md_cfg, seed=1, platform=plat)
+                res["baseline"][plat] = time_baseline(corr, pos, vel, masses, full_steps, args.macro_steps, args.warmup)
+                LOGGER.info("%-24s baseline %-5s %.4f s/ps", mol, plat, res["baseline"][plat])
+            except Exception as exc:  # platform unavailable
+                LOGGER.warning("Platform %s failed: %s", plat, exc)
+        best_plat = min(res["baseline"], key=res["baseline"].get)
+        res["best_platform"] = best_plat
+        res["baseline_s_per_ps"] = res["baseline"][best_plat]
+        res["micro_step_s"] = res["baseline_s_per_ps"] * float(md_cfg.get("dt_fs", 2.0)) * 1e-3
+        for label, spec in conditions.items():
+            predictor = make_predictor(spec, device, args.flow_steps)
+            corr = OpenMMCorrector(args.raw_root / mol, md_cfg, seed=1, platform=best_plat)
+            opts = HybridOptions(jump_time_ps=jump_steps * corr.micro_dt_ps, corrector_steps=corr_steps,
+                                 max_bond_strain=0.0, max_attempts=1)
+            gen = torch.Generator(device=device).manual_seed(0)
+            run_hybrid(predictor, corr, pos, vel, masses, init["atom_types"], args.warmup, opts, device, gen)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            s = run_hybrid(predictor, corr, pos, vel, masses, init["atom_types"], args.macro_steps, opts, device,
+                           gen)["summary"]
+            sim_ps = s["simulated_ps"]
+            res[label] = {
+                "s_per_ps": s["wall_clock_s"] / sim_ps,
+                "model_s_per_ps": s["model_time_s"] / sim_ps,
+                "corrector_s_per_ps": s["corrector_time_s"] / sim_ps,
+                "model_latency_ms": 1e3 * s["model_time_s"] / args.macro_steps,
+                "speedup_vs_baseline": res["baseline_s_per_ps"] / (s["wall_clock_s"] / sim_ps),
+            }
+            LOGGER.info("%-24s %-12s %.4f s/ps (model %.2f ms/step) -> speedup %.2fx", mol, label,
+                        res[label]["s_per_ps"], res[label]["model_latency_ms"], res[label]["speedup_vs_baseline"])
+            del predictor
+        results[mol] = res
 
-    for mol in molecules:
-        LOGGER.info("Processing %s", mol)
-        base_traj_path = args.baseline_root / mol / "trajectory.npz"
-        egnn_path = args.egnn_root / f"{mol}.npz"
-        tr_path = args.transformer_root / f"{mol}.npz"
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    meta = {"k_steps": args.k_steps, "save_interval": S, "corrector_steps": corr_steps, "macro_steps": args.macro_steps,
+            "device": torch.cuda.get_device_name() if device.type == "cuda" else "cpu"}
+    write_json({"meta": meta, "molecules": results}, args.out_dir / "time_study.json")
 
-        if not egnn_path.exists() or not tr_path.exists():
-            LOGGER.warning("Missing hybrids for %s; skipping", mol)
-            continue
+    labels: List[str] = list(conditions)
+    lines = [f"# Wall-clock study (k={args.k_steps}, {corr_steps} corrector steps, {meta['device']})", "",
+             "Seconds of wall-clock per simulated ps (lower is better); speedup = baseline / hybrid.", "",
+             "| molecule | baseline (best platform) | " + " | ".join(f"{lb} s/ps (speedup, model ms/step)" for lb in labels) + " |",
+             "|---|---|" + "---|" * len(labels)]
+    for mol, r in results.items():
+        cells = [f"{r[lb]['s_per_ps']:.4f} ({r[lb]['speedup_vs_baseline']:.2f}x, {r[lb]['model_latency_ms']:.2f})" for lb in labels]
+        lines.append(f"| {mol} | {r['baseline_s_per_ps']:.4f} ({r['best_platform']}) | " + " | ".join(cells) + " |")
+    mean_cells = [f"{np.mean([r[lb]['speedup_vs_baseline'] for r in results.values()]):.2f}x" for lb in labels]
+    lines += ["| **mean speedup** | | " + " | ".join(mean_cells) + " |", ""]
+    (args.out_dir / "time_study.md").write_text("\n".join(lines))
+    print("\n".join(lines))
 
-        # Estimate baseline wall-clock via short run
-        # OpenMM system lives under data/raw/<mol>
-        est_time, baseline_meta = estimate_baseline_time(Path("data/raw") / mol, args.md_config, base_traj_path, args.steps, args.k_steps, args.device)
+    try:
+        import matplotlib
 
-        egnn = load_npz(egnn_path)
-        tr = load_npz(tr_path)
-        egnn_time = float(egnn["metadata"].get("wall_clock_s", np.nan))
-        tr_time = float(tr["metadata"].get("wall_clock_s", np.nan))
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
 
-        base = load_npz(base_traj_path)
-        atom_types = base["atom_types"]
-        # Align lengths
-        T = min(len(base["pos"]), len(egnn["pos"]))
-        egnn_curve = bond_rmse_per_step(base["pos"][:T], egnn["pos"][:T], atom_types)
-        T2 = min(len(base["pos"]), len(tr["pos"]))
-        tr_curve = bond_rmse_per_step(base["pos"][:T2], tr["pos"][:T2], atom_types)
-
-        egnn_curves.append(egnn_curve)
-        tr_curves.append(tr_curve)
-
-        summary[mol] = {
-            "time": {
-                "baseline_est_s": est_time,
-                "egnn_s": egnn_time,
-                "transformer_s": tr_time,
-                "speedup_egnn": float(est_time / max(egnn_time, 1e-6)),
-                "speedup_transformer": float(est_time / max(tr_time, 1e-6)),
-            },
-            "accuracy": {
-                "bond_rmse_per_step_egnn": egnn_curve.tolist(),
-                "bond_rmse_per_step_transformer": tr_curve.tolist(),
-            },
-            "baseline_meta": baseline_meta,
-        }
-
-    # Save summary JSON
-    (args.out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-    # Plot: time bar chart per molecule
-    mols = list(summary.keys())
-    if mols:
-        x = np.arange(len(mols))
-        width = 0.25
-        base_times = np.array([summary[m]["time"]["baseline_est_s"] for m in mols], dtype=float)
-        e_times = np.array([summary[m]["time"]["egnn_s"] for m in mols], dtype=float)
-        t_times = np.array([summary[m]["time"]["transformer_s"] for m in mols], dtype=float)
-
-        plt.figure(figsize=(max(10, len(mols) * 0.7), 5))
-        plt.bar(x - width, base_times, width=width, label="Baseline (est)")
-        plt.bar(x, e_times, width=width, label="EGNN")
-        plt.bar(x + width, t_times, width=width, label="Transformer")
-        plt.xticks(x, mols, rotation=60, ha="right")
-        plt.ylabel("Wall-clock time (s)")
-        plt.title("Per-molecule wall-clock times (50 macro-steps, k=4, 100 ps windows)")
-        plt.tight_layout()
-        plt.legend()
-        plt.savefig(args.out_dir / "time_bar_methods.png", dpi=200)
-        plt.close()
-
-        # Plot: accuracy per step (bond RMSE) averaged across molecules
-        if egnn_curves and tr_curves:
-            # Pad curves to common length with NaN and compute mean over valid entries
-            max_T = max(cur.shape[0] for cur in egnn_curves)
-            def pad_to(arrs: List[np.ndarray], T: int) -> np.ndarray:
-                padded = np.full((len(arrs), T), np.nan, dtype=np.float32)
-                for i, a in enumerate(arrs):
-                    padded[i, : a.shape[0]] = a
-                return padded
-
-            e_stack = pad_to(egnn_curves, max_T)
-            t_stack = pad_to(tr_curves, max_T)
-            e_mean = np.nanmean(e_stack, axis=0)
-            e_std = np.nanstd(e_stack, axis=0)
-            t_mean = np.nanmean(t_stack, axis=0)
-            t_std = np.nanstd(t_stack, axis=0)
-
-            steps_axis = np.arange(max_T)
-            plt.figure(figsize=(8, 4))
-            plt.plot(steps_axis, e_mean, label="EGNN")
-            plt.fill_between(steps_axis, e_mean - e_std, e_mean + e_std, alpha=0.2)
-            plt.plot(steps_axis, t_mean, label="Transformer")
-            plt.fill_between(steps_axis, t_mean - t_std, t_mean + t_std, alpha=0.2)
-            plt.xlabel("Macro-step index")
-            plt.ylabel("Bond RMSE (Å)")
-            plt.title("Accuracy per time step vs baseline (mean ± std across molecules)")
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.legend()
-            plt.savefig(args.out_dir / "accuracy_per_step.png", dpi=200)
-            plt.close()
-
-    LOGGER.info("Saved time study to %s", args.out_dir)
+        fig, ax = plt.subplots(figsize=(1.6 + 1.1 * (len(labels) + 1), 3.6))
+        names = ["baseline"] + labels
+        model_part = [0.0] + [np.mean([r[lb]["model_s_per_ps"] for r in results.values()]) for lb in labels]
+        corr_part = [np.mean([r["baseline_s_per_ps"] for r in results.values()])] + \
+                    [np.mean([r[lb]["corrector_s_per_ps"] for r in results.values()]) for lb in labels]
+        total = [np.mean([r["baseline_s_per_ps"] for r in results.values()])] + \
+                [np.mean([r[lb]["s_per_ps"] for r in results.values()]) for lb in labels]
+        other = [max(t - m - c, 0.0) for t, m, c in zip(total, model_part, corr_part)]
+        ax.bar(names, corr_part, color="#4C72B0", label="MD / corrector")
+        ax.bar(names, model_part, bottom=corr_part, color="#DD8452", label="model")
+        ax.bar(names, other, bottom=np.add(corr_part, model_part), color="#BBBBBB", label="other")
+        ax.set_ylabel("wall-clock s per simulated ps")
+        ax.legend(frameon=False, fontsize=8)
+        ax.spines[["top", "right"]].set_visible(False)
+        fig.tight_layout()
+        fig.savefig(args.out_dir / "time_study.png", dpi=160)
+    except ImportError:
+        pass
 
 
 if __name__ == "__main__":

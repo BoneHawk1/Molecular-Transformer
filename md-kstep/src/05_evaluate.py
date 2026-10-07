@@ -1,281 +1,171 @@
-"""Evaluate energy drift, structural statistics, and efficiency of hybrid integrator runs."""
+"""Evaluate hybrid rollouts against the baseline MD (distributions + dynamics).
+
+For each condition (``--hybrid label=dir``) and molecule, the hybrid trajectory
+``dir/<molecule>.npz`` is compared with every k-th frame of the baseline, so both
+series have (nearly) the same time between frames. If ``--reference2`` points at a
+second baseline run with a different seed, the same comparison between the two
+baselines is reported as ``noise_floor``: any hybrid number within that range is
+indistinguishable from MD.
+
+Outputs ``metrics.json`` (per molecule) and ``summary.md`` (means per split).
+
+Example::
+
+    python src/05_eval_drift_rdfs.py --baseline data/md --reference2 data/md_seed2 \\
+        --hybrid zero=outputs/v2/hybrid/zero_k4 flow=outputs/v2/hybrid/flow_k4 \\
+        --splits-dir data/splits --out-dir outputs/v2/eval
+"""
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from typing import Dict, List
 
 import numpy as np
 
-from utils import configure_logging, ensure_dir, LOGGER
+from kstep.common import LOGGER, configure_logging, load_trajectory, write_json
+from kstep.metrics import Topology, compare
 
-COVALENT_RADII = {
-    1: 0.31,
-    6: 0.76,
-    7: 0.71,
-    8: 0.66,
-    9: 0.57,
-    15: 1.07,
-    16: 1.05,
-    17: 1.02,
-}
-
-
-def _parse_json_field(raw: Any, expected: Union[type, Tuple[type, ...]], default: Any) -> Any:
-    """Decode JSON-serialised NPZ fields, falling back to Python objects."""
-    if raw is None:
-        return default
-    if isinstance(raw, np.ndarray):
-        # np.load wraps pickled objects/strings in 0-d arrays
-        if raw.shape == ():
-            return _parse_json_field(raw.item(), expected, default)
-        raw = raw.tolist()
-    if isinstance(raw, expected):
-        return raw
-    if isinstance(raw, (str, bytes)):
-        try:
-            loaded = json.loads(raw)
-        except json.JSONDecodeError:
-            return default
-        return loaded if isinstance(loaded, expected) else default
-    return default
+HEADLINE = [
+    ("lag_rmsd_A_ratio", "lag-RMSD ratio", "1 = moves as far per step as MD"),
+    ("torsion_step_deg_ratio", "torsion-step ratio", "1 = MD"),
+    ("torsion_transitions_per_ps_ratio", "torsion-flip-rate ratio", "1 = MD"),
+    ("torsion_js", "torsion JS", "0 = identical distribution"),
+    ("angle_js", "angle JS", ""),
+    ("bond_js", "bond JS", ""),
+    ("rdf_l1", "pair-dist L1", ""),
+    ("ekin_ratio", "<KE> ratio", "1 = correct temperature"),
+]
+RUN_FIELDS = ["force_call_savings", "accepted_fraction", "escalated_fraction", "fallback_fraction", "wall_clock_s",
+              "model_time_s", "corrector_time_s", "simulated_ps"]
 
 
-def load_npz(path: Path) -> Dict:
-    data = np.load(path, allow_pickle=True)
-    metadata = _parse_json_field(data.get("metadata"), dict, {})
-    nve_windows = _parse_json_field(data.get("nve_windows"), list, [])
-    trajectory = {
-        "pos": data["pos"],
-        "vel": data["vel"],
-        "Etot": data["Etot"],
-        "time_ps": data["time_ps"],
-        "atom_types": data["atom_types"],
-        "metadata": metadata,
-        "nve_windows": nve_windows,
-    }
-    return trajectory
+def frame_ps(traj: Dict) -> float:
+    t = np.asarray(traj["time_ps"], dtype=np.float64)
+    return float(np.median(np.diff(t)))
 
 
-def guess_bonds(positions_nm: np.ndarray, atom_types: np.ndarray, tol: float = 0.1) -> List[Tuple[int, int]]:
-    coords = positions_nm * 10.0  # convert to Å
-    num_atoms = coords.shape[0]
-    bonds: List[Tuple[int, int]] = []
-    for i in range(num_atoms):
-        for j in range(i + 1, num_atoms):
-            ri = COVALENT_RADII.get(int(atom_types[i]), 0.75)
-            rj = COVALENT_RADII.get(int(atom_types[j]), 0.75)
-            cutoff = ri + rj + tol
-            dist = np.linalg.norm(coords[i] - coords[j])
-            if dist <= cutoff:
-                bonds.append((i, j))
-    return bonds
+def load_splits(splits_dir: Path | None) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if splits_dir is None:
+        return out
+    for split in ("train", "val", "test"):
+        path = splits_dir / f"{split}.json"
+        if path.exists():
+            for mol in json.loads(path.read_text())["molecules"]:
+                out[mol] = split
+    return out
 
 
-def build_angles(bonds: List[Tuple[int, int]]) -> List[Tuple[int, int, int]]:
-    adjacency: Dict[int, List[int]] = {}
-    for i, j in bonds:
-        adjacency.setdefault(i, []).append(j)
-        adjacency.setdefault(j, []).append(i)
-    angles: List[Tuple[int, int, int]] = []
-    for center, neighbors in adjacency.items():
-        if len(neighbors) < 2:
+def evaluate_condition(base: Dict, hyb: Dict, ref2: Dict | None, topo: Topology) -> Dict:
+    base_dt = frame_ps(base)
+    meta = hyb["metadata"]
+    hyb_dt = float(meta.get("macro_step_ps", frame_ps(hyb)))
+    lag = max(1, int(round(hyb_dt / base_dt)))
+    n = min(len(hyb["pos"]), len(base["pos"][::lag]))
+    ref = {"pos": base["pos"][::lag][:n], "vel": base["vel"][::lag][:n]}
+    test = {"pos": hyb["pos"][:n], "vel": hyb["vel"][:n]}
+    masses = np.asarray(base["masses"], dtype=np.float64)
+    out = {"metrics": compare(ref, test, topo, lag * base_dt, hyb_dt, masses), "frames": n, "lag_frames": lag,
+           "run": {k: meta.get(k) for k in RUN_FIELDS}}
+    if ref2 is not None:
+        r2 = {"pos": ref2["pos"][::lag][:n], "vel": ref2["vel"][::lag][:n]}
+        out["noise_floor"] = compare(ref, r2, topo, lag * base_dt, lag * base_dt, masses)
+    return out
+
+
+def fmt(x) -> str:
+    if x is None or (isinstance(x, float) and not np.isfinite(x)):
+        return "–"
+    return f"{x:.3f}" if abs(x) < 100 else f"{x:.0f}"
+
+
+def summarise(results: Dict, splits: Dict[str, str], labels: List[str]) -> str:
+    lines = ["# Hybrid evaluation summary", "",
+             "Means over molecules. *noise floor* = second baseline seed vs baseline, at the same frame spacing.", ""]
+    groups = {"test": [m for m in results if splits.get(m) == "test"],
+              "val": [m for m in results if splits.get(m) == "val"],
+              "train": [m for m in results if splits.get(m) == "train"],
+              "all": list(results)}
+    for group, mols in groups.items():
+        if not mols:
             continue
-        for idx in range(len(neighbors)):
-            for jdx in range(idx + 1, len(neighbors)):
-                angles.append((neighbors[idx], center, neighbors[jdx]))
-    return angles
-
-
-def build_dihedrals(bonds: List[Tuple[int, int]]) -> List[Tuple[int, int, int, int]]:
-    adjacency: Dict[int, List[int]] = {}
-    for i, j in bonds:
-        adjacency.setdefault(i, []).append(j)
-        adjacency.setdefault(j, []).append(i)
-    dihedrals: List[Tuple[int, int, int, int]] = []
-    for bond in bonds:
-        i, j = bond
-        for k in adjacency.get(j, []):
-            if k == i:
-                continue
-            for l in adjacency.get(k, []):
-                if l in (i, j):
-                    continue
-                dihedrals.append((i, j, k, l))
-    # remove duplicates by normalizing tuples
-    unique = set()
-    ordered: List[Tuple[int, int, int, int]] = []
-    for a, b, c, d in dihedrals:
-        key = (a, b, c, d)
-        rev_key = (d, c, b, a)
-        if key in unique or rev_key in unique:
-            continue
-        unique.add(key)
-        ordered.append(key)
-    return ordered
-
-
-def measure_bonds(positions_nm: np.ndarray, bonds: List[Tuple[int, int]]) -> np.ndarray:
-    coords = positions_nm * 10.0
-    lengths = [np.linalg.norm(coords[i] - coords[j]) for i, j in bonds]
-    return np.asarray(lengths, dtype=np.float32)
-
-
-def measure_angles(positions_nm: np.ndarray, triples: List[Tuple[int, int, int]]) -> np.ndarray:
-    coords = positions_nm * 10.0
-    values: List[float] = []
-    for i, j, k in triples:
-        v1 = coords[i] - coords[j]
-        v2 = coords[k] - coords[j]
-        v1 /= np.linalg.norm(v1) + 1e-9
-        v2 /= np.linalg.norm(v2) + 1e-9
-        cos_theta = np.clip(np.dot(v1, v2), -1.0, 1.0)
-        values.append(np.degrees(np.arccos(cos_theta)))
-    return np.asarray(values, dtype=np.float32)
-
-
-def measure_dihedrals(positions_nm: np.ndarray, quads: List[Tuple[int, int, int, int]]) -> np.ndarray:
-    coords = positions_nm * 10.0
-    values: List[float] = []
-    for i, j, k, l in quads:
-        b0 = coords[j] - coords[i]
-        b1 = coords[k] - coords[j]
-        b2 = coords[l] - coords[k]
-        b1 /= np.linalg.norm(b1) + 1e-9
-        v = b0 - np.dot(b0, b1) * b1
-        w = b2 - np.dot(b2, b1) * b1
-        x = np.dot(v, w)
-        y = np.linalg.norm(np.cross(v, b1)) * np.linalg.norm(w)
-        angle = np.degrees(np.arctan2(y, x + 1e-9))
-        values.append(angle)
-    return np.asarray(values, dtype=np.float32)
-
-
-def compute_rdf(positions_nm: np.ndarray, atom_types: np.ndarray, bins: np.ndarray) -> np.ndarray:
-    coords = positions_nm * 10.0
-    heavy_idx = np.where(atom_types > 1)[0]
-    coords = coords[heavy_idx]
-    if coords.shape[0] < 2:
-        return np.zeros(len(bins) - 1, dtype=np.float32)
-    dists = []
-    for i in range(coords.shape[0]):
-        diff = coords[i + 1:] - coords[i]
-        d = np.linalg.norm(diff, axis=1)
-        dists.append(d)
-    if not dists:
-        return np.zeros(len(bins) - 1, dtype=np.float32)
-    d_all = np.concatenate(dists)
-    hist, _ = np.histogram(d_all, bins=bins, density=True)
-    return hist.astype(np.float32)
-
-
-def energy_drift_per_ps(window: Dict, dt_fs: float) -> float:
-    total = np.asarray(window["total"], dtype=np.float64)
-    length_ps = len(total) * (dt_fs * 0.001)
-    return float((total[-1] - total[0]) / max(length_ps, 1e-3))
-
-
-def summarize_drift(windows: List[Dict], dt_fs: float) -> Dict[str, float]:
-    if not windows:
-        return {"median": float("nan"), "iqr": float("nan")}
-    drifts = np.array([energy_drift_per_ps(window, dt_fs) for window in windows])
-    return {
-        "median": float(np.median(drifts)),
-        "iqr": float(np.subtract(*np.percentile(drifts, [75, 25])))
-    }
-
-
-def evaluate_molecule(mol: str, baseline_traj: Dict, hybrid_traj: Dict, bins: np.ndarray) -> Dict:
-    atom_types = baseline_traj["atom_types"]
-    bonds = guess_bonds(baseline_traj["pos"][0], atom_types)
-    angles = build_angles(bonds)
-    dihedrals = build_dihedrals(bonds)
-
-    # Multi-frame structural metrics
-    T = min(len(baseline_traj["pos"]), len(hybrid_traj["pos"]))
-    bond_sq = []
-    angle_sq = []
-    dihedral_sq = []
-    rdf_l1 = []
-    for t in range(T):
-        b_bonds = measure_bonds(baseline_traj["pos"][t], bonds) if len(bonds) else np.array([])
-        h_bonds = measure_bonds(hybrid_traj["pos"][t], bonds) if len(bonds) else np.array([])
-        if b_bonds.size:
-            bond_sq.append(np.mean((b_bonds - h_bonds) ** 2))
-
-        b_ang = measure_angles(baseline_traj["pos"][t], angles) if len(angles) else np.array([])
-        h_ang = measure_angles(hybrid_traj["pos"][t], angles) if len(angles) else np.array([])
-        if b_ang.size:
-            angle_sq.append(np.mean((b_ang - h_ang) ** 2))
-
-        b_dih = measure_dihedrals(baseline_traj["pos"][t], dihedrals) if len(dihedrals) else np.array([])
-        h_dih = measure_dihedrals(hybrid_traj["pos"][t], dihedrals) if len(dihedrals) else np.array([])
-        if b_dih.size:
-            dihedral_sq.append(np.mean((b_dih - h_dih) ** 2))
-
-        b_rdf = compute_rdf(baseline_traj["pos"][t], atom_types, bins)
-        h_rdf = compute_rdf(hybrid_traj["pos"][t], atom_types, bins)
-        rdf_l1.append(np.mean(np.abs(b_rdf - h_rdf)))
-
-    bond_rmse = float(np.sqrt(np.mean(bond_sq))) if bond_sq else float("nan")
-    angle_rmse = float(np.sqrt(np.mean(angle_sq))) if angle_sq else float("nan")
-    dihedral_rmse = float(np.sqrt(np.mean(dihedral_sq))) if dihedral_sq else float("nan")
-    rdf_l1_mean = float(np.mean(rdf_l1)) if rdf_l1 else float("nan")
-
-    dt_fs = baseline_traj["metadata"].get("config", {}).get("dt_fs", 2.0)
-    return {
-        "molecule": mol,
-        "nve_drift_baseline": summarize_drift(baseline_traj["nve_windows"], dt_fs),
-        "nve_drift_hybrid": summarize_drift(hybrid_traj["nve_windows"], dt_fs),
-        "bond_diff_rmse": bond_rmse,
-        "angle_diff_rmse": angle_rmse,
-        "dihedral_diff_rmse": dihedral_rmse,
-        "rdf_l1": rdf_l1_mean,
-    }
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", type=Path, required=True, help="Baseline trajectory root")
-    parser.add_argument("--hybrid-runs", type=Path, required=True, help="Hybrid trajectory root")
-    parser.add_argument("--hybrid-pattern", default="{molecule}.npz", help="Filename pattern for hybrid runs")
-    parser.add_argument("--out-dir", type=Path, required=True, help="Output directory for metrics JSON")
-    parser.add_argument("--rdf-max", type=float, default=12.0, help="RDF upper bound in Å")
-    parser.add_argument("--rdf-bins", type=int, default=60, help="Number of RDF bins")
-    return parser
+        lines += [f"## {group} molecules ({len(mols)}): {', '.join(sorted(mols))}", ""]
+        header = "| condition | " + " | ".join(h[1] for h in HEADLINE) + " | force-call savings | accepted | wall s / ps |"
+        lines += [header, "|" + "---|" * (len(HEADLINE) + 4)]
+        conds = labels + ["noise_floor"]
+        for cond in conds:
+            vals, run_vals = [], {}
+            for key, _, _ in HEADLINE:
+                xs = []
+                for m in mols:
+                    if cond == "noise_floor":
+                        any_label = next((lb for lb in labels if lb in results[m] and "noise_floor" in results[m][lb]), None)
+                        if any_label:
+                            xs.append(results[m][any_label]["noise_floor"].get(key, np.nan))
+                    elif cond in results[m]:
+                        xs.append(results[m][cond]["metrics"].get(key, np.nan))
+                vals.append(float(np.nanmean(xs)) if xs and np.isfinite(xs).any() else None)
+            if cond != "noise_floor":
+                runs = [results[m][cond]["run"] for m in mols if cond in results[m]]
+                for f in ("force_call_savings", "accepted_fraction"):
+                    v = [r.get(f) for r in runs if r.get(f) is not None]
+                    run_vals[f] = float(np.mean(v)) if v else None
+                spp = [r["wall_clock_s"] / r["simulated_ps"] for r in runs if r.get("simulated_ps")]
+                run_vals["sps"] = float(np.mean(spp)) if spp else None
+            extra = [fmt(run_vals.get("force_call_savings")), fmt(run_vals.get("accepted_fraction")), fmt(run_vals.get("sps"))] \
+                if cond != "noise_floor" else ["–", "–", "–"]
+            name = f"*{cond}*" if cond == "noise_floor" else cond
+            lines.append(f"| {name} | " + " | ".join(fmt(v) for v in vals) + " | " + " | ".join(extra) + " |")
+        lines.append("")
+    lines += ["Metric notes: " + "; ".join(f"**{h[1]}** – {h[2]}" for h in HEADLINE if h[2]), ""]
+    return "\n".join(lines)
 
 
 def main() -> None:
-    args = build_argparser().parse_args()
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--baseline", type=Path, required=True, help="data/md (per-molecule trajectory.npz)")
+    p.add_argument("--reference2", type=Path, default=None,
+                   help="Second baseline run (different seed) for the noise floor, or 'half' to split the baseline")
+    p.add_argument("--hybrid", nargs="+", required=True, help="label=dir pairs; dir holds <molecule>.npz")
+    p.add_argument("--splits-dir", type=Path, default=None)
+    p.add_argument("--out-dir", type=Path, required=True)
+    args = p.parse_args()
     configure_logging()
-    ensure_dir(args.out_dir)
 
-    bins = np.linspace(0, args.rdf_max, args.rdf_bins + 1)
-    metrics: List[Dict] = []
-
-    for mol_dir in sorted(args.baseline.iterdir()):
-        traj_path = mol_dir / "trajectory.npz"
-        if not traj_path.exists():
+    conditions = dict(item.split("=", 1) if "=" in item else (Path(item).name, item) for item in args.hybrid)
+    splits = load_splits(args.splits_dir)
+    results: Dict[str, Dict] = {}
+    for mol_dir in sorted(d for d in args.baseline.iterdir() if (d / "trajectory.npz").exists()):
+        mol = mol_dir.name
+        runs = {lb: Path(d) / f"{mol}.npz" for lb, d in conditions.items() if (Path(d) / f"{mol}.npz").exists()}
+        if not runs:
             continue
-        baseline_traj = load_npz(traj_path)
-        hybrid_path = args.hybrid_runs / args.hybrid_pattern.format(molecule=mol_dir.name)
-        if not hybrid_path.exists():
-            LOGGER.warning("Hybrid trajectory missing for %s", mol_dir.name)
-            continue
-        hybrid_traj = load_npz(hybrid_path)
-        metrics.append(evaluate_molecule(mol_dir.name, baseline_traj, hybrid_traj, bins))
-
-    summary_path = args.out_dir / "metrics.json"
-    summary = {
-        "molecules": metrics,
-        "mean_bond_rmse": float(np.nanmean([m["bond_diff_rmse"] for m in metrics])) if metrics else float("nan"),
-        "mean_angle_rmse": float(np.nanmean([m["angle_diff_rmse"] for m in metrics])) if metrics else float("nan"),
-        "mean_dihedral_rmse": float(np.nanmean([m["dihedral_diff_rmse"] for m in metrics])) if metrics else float("nan"),
-        "mean_rdf_l1": float(np.nanmean([m["rdf_l1"] for m in metrics])) if metrics else float("nan"),
-    }
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    LOGGER.info("Wrote metrics to %s", summary_path)
+        base = load_trajectory(mol_dir / "trajectory.npz")
+        ref2 = None
+        if args.reference2 is not None and str(args.reference2) == "half":
+            # No independent repeat (e.g. expensive QM): split the baseline in two halves
+            half = len(base["pos"]) // 2
+            ref2 = {**base, "pos": base["pos"][half:], "vel": base["vel"][half:]}
+            base = {**base, "pos": base["pos"][:half], "vel": base["vel"][:half]}
+        elif args.reference2 is not None and (args.reference2 / mol / "trajectory.npz").exists():
+            ref2 = load_trajectory(args.reference2 / mol / "trajectory.npz")
+        topo = Topology(base["pos"][0], base["atom_types"])
+        results[mol] = {"split": splits.get(mol, "?")}
+        for label, path in runs.items():
+            results[mol][label] = evaluate_condition(base, load_trajectory(path), ref2, topo)
+            m = results[mol][label]["metrics"]
+            LOGGER.info("%-24s %-14s lagRMSD x%.2f  torsionJS %.3f  flips x%.2f", mol, label,
+                        m.get("lag_rmsd_A_ratio", np.nan), m.get("torsion_js", np.nan),
+                        m.get("torsion_transitions_per_ps_ratio", np.nan))
+    if not results:
+        raise SystemExit("No hybrid trajectories matched the baseline molecules")
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    write_json({"conditions": conditions, "molecules": results}, args.out_dir / "metrics.json")
+    summary = summarise(results, splits, list(conditions))
+    (args.out_dir / "summary.md").write_text(summary)
+    print(summary)
 
 
 if __name__ == "__main__":

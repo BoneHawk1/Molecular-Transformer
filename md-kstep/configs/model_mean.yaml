@@ -1,0 +1,7 @@
+# Deterministic k-step model (conditional mean of Δx, Δv) on the same equivariant backbone.
+kind: mean
+hidden_dim: 128
+num_layers: 4
+num_rbf: 32
+cutoff_nm: 1.2
+msg_norm: 8.0

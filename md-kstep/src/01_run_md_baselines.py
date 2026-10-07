@@ -15,6 +15,9 @@ from openmm.app import PDBFile, Simulation
 
 from utils import configure_logging, ensure_dir, load_yaml, set_seed, compute_time_grid, LOGGER
 
+# NVE windows record the energy every NVE_ENERGY_STRIDE steps (stored with the window)
+NVE_ENERGY_STRIDE = 10
+
 
 @dataclass
 class MDConfig:
@@ -110,19 +113,21 @@ def _run_nve_window(system, topology, positions, velocities, config: MDConfig, p
     simulation.context.setVelocities(velocities)
 
     energies = []
-    for _ in range(steps):
+    stride = NVE_ENERGY_STRIDE
+    for _ in range(0, steps, stride):
         state = simulation.context.getState(getEnergy=True)
         energies.append([
             state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole),
             state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole),
         ])
-        simulation.step(1)
+        simulation.step(stride)
 
     energies = np.asarray(energies, dtype=np.float64)
     return {
         "kinetic": energies[:, 0],
         "potential": energies[:, 1],
         "total": energies.sum(axis=1),
+        "stride_steps": stride,
     }
 
 
@@ -135,6 +140,7 @@ def run_md(molecule_dir: Path, out_dir: Path, config: MDConfig) -> Path:
         config.dt_fs * unit.femtosecond,
     )
 
+    integrator.setRandomNumberSeed(config.random_seed)
     simulation = _create_simulation(pdb, system, integrator, config.platform)
     _initialise_simulation(simulation, pdb, config.temperature_K, config.random_seed)
 
@@ -153,41 +159,40 @@ def run_md(molecule_dir: Path, out_dir: Path, config: MDConfig) -> Path:
     total = np.zeros_like(kinetic)
     forces = np.zeros_like(positions) if config.store_forces else None
 
-    save_idx = 0
     nve_payload: List[Dict[str, np.ndarray]] = []
     nve_window_steps = int((config.nve_window_ps * 1000) / (config.dt_fs)) if config.nve_window_ps > 0 else 0
     nve_every_steps = int((config.nve_every_ps * 1000) / (config.dt_fs)) if config.nve_every_ps > 0 else 0
 
-    for step in range(0, total_steps + 1):
-        if step % save_interval == 0:
-            frame = _collect_frame(simulation, config.store_forces)
-            positions[save_idx] = frame["positions"]
-            velocities[save_idx] = frame["velocities"]
-            kinetic[save_idx] = frame["kinetic"]
-            potential[save_idx] = frame["potential"]
-            total[save_idx] = frame["total"]
-            if config.store_forces:
-                assert forces is not None
-                forces[save_idx] = frame["forces"]
+    # Advance in chunks of save_interval steps (one Python call per stored frame)
+    for save_idx in range(num_frames):
+        step = save_idx * save_interval
+        frame = _collect_frame(simulation, config.store_forces)
+        positions[save_idx] = frame["positions"]
+        velocities[save_idx] = frame["velocities"]
+        kinetic[save_idx] = frame["kinetic"]
+        potential[save_idx] = frame["potential"]
+        total[save_idx] = frame["total"]
+        if config.store_forces:
+            assert forces is not None
+            forces[save_idx] = frame["forces"]
 
-            if nve_window_steps > 0 and nve_every_steps > 0 and step % nve_every_steps == 0:
-                LOGGER.info("Running NVE window (%d steps) from step %d", nve_window_steps, step)
-                state = simulation.context.getState(getPositions=True, getVelocities=True)
-                nve_payload.append(
-                    _run_nve_window(
-                        system,
-                        pdb.topology,
-                        state.getPositions(asNumpy=True),
-                        state.getVelocities(asNumpy=True),
-                        config,
-                        config.platform,
-                        nve_window_steps,
-                    )
+        if nve_window_steps > 0 and nve_every_steps > 0 and step % nve_every_steps == 0:
+            LOGGER.info("Running NVE window (%d steps) from step %d", nve_window_steps, step)
+            state = simulation.context.getState(getPositions=True, getVelocities=True)
+            nve_payload.append(
+                _run_nve_window(
+                    system,
+                    pdb.topology,
+                    state.getPositions(asNumpy=True),
+                    state.getVelocities(asNumpy=True),
+                    config,
+                    config.platform,
+                    nve_window_steps,
                 )
+            )
 
-            save_idx += 1
-        if step < total_steps:
-            simulation.step(1)
+        if save_idx < num_frames - 1:
+            simulation.step(save_interval)
 
     time_ps = compute_time_grid(num_frames, config.dt_fs, save_interval)
     metadata = {
@@ -200,7 +205,8 @@ def run_md(molecule_dir: Path, out_dir: Path, config: MDConfig) -> Path:
     ensure_dir(out_dir)
     npz_path = out_dir / "trajectory.npz"
     nve_serialised = json.dumps([
-        {key: value.tolist() for key, value in window.items()} for window in nve_payload
+        {key: (value.tolist() if hasattr(value, "tolist") else value) for key, value in window.items()}
+        for window in nve_payload
     ])
     np.savez(
         npz_path,
@@ -228,6 +234,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, required=True, help="MD configuration YAML")
     parser.add_argument("--out", type=Path, required=True, help="Output directory for trajectories")
     parser.add_argument("--store-forces", action="store_true", help="Store instantaneous forces in the NPZ")
+    parser.add_argument("--seed", type=int, default=None, help="Override random_seed (e.g. for a second reference run)")
+    parser.add_argument("--length-ns", type=float, default=None, help="Override trajectory length")
+    parser.add_argument("--no-nve", action="store_true", help="Skip NVE energy-conservation windows")
     return parser
 
 
@@ -236,6 +245,12 @@ def main() -> None:
     configure_logging()
     config_dict = load_yaml(args.config)
     config_dict["store_forces"] = args.store_forces or config_dict.get("store_forces", False)
+    if args.seed is not None:
+        config_dict["random_seed"] = args.seed
+    if args.length_ns is not None:
+        config_dict["length_ns"] = args.length_ns
+    if args.no_nve:
+        config_dict["nve_window_ps"] = 0.0
     config = MDConfig.from_dict(config_dict)
     set_seed(config.random_seed)
 
